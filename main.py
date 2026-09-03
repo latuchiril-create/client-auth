@@ -6,9 +6,9 @@ import asyncpg
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-BOT_TOKEN = os.getenv("8644982552:AAFwIkFW2CHEkKJY7vWN8g1oan9jSusiNqM")
-ADMIN_ID = int(os.getenv("5932605788", "0"))
-DB_URL = os.getenv("postgresql://postgres:[NBLveIUozYEd1jHt]@db.pmltavdqrpjxoozznwdv.supabase.co:5432/postgres")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+DB_URL = os.getenv("DB_URL")
 
 app = FastAPI()
 bot = Bot(token=BOT_TOKEN)
