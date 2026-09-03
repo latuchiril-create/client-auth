@@ -91,3 +91,6 @@ async def ban_sub(callback: types.CallbackQuery):
         await conn.execute("UPDATE users SET status = 'banned', ban_reason = 'Заблокирован админом' WHERE username = $1", username)
     await callback.message.edit_text(f"⛔ Пользователь <b>{username}</b> заблокирован.", parse_mode="HTML")
     await callback.answer("Забанен!")
+    @dp.message(Command("start"))
+async def start_cmd(message: types.Message):
+    await message.reply(f"👋 Привет! Бот авторизации работает.\nТвой ID: <code>{message.from_user.id}</code>", parse_mode="HTML")
