@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 import asyncpg
 from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -38,7 +39,6 @@ async def auth(data: AuthRequest):
     async with db_pool.acquire() as conn:
         user = await conn.fetchrow("SELECT * FROM users WHERE username = $1", data.username)
 
-        # Новый юзер — создаем со статусом pending и шлем уведомление в ТГ
         if not user:
             await conn.execute(
                 "INSERT INTO users (username, hwid, status) VALUES ($1, $2, 'pending')",
@@ -56,21 +56,22 @@ async def auth(data: AuthRequest):
 
             return {"status": "pending", "message": "Подписка не активирована. Ожидайте одобрения."}
 
-        # Если забанен
         if user["status"] == "banned":
             return {"status": "banned", "message": user["ban_reason"] or "Вы заблокированы."}
 
-        # Если не подтвержден
         if user["status"] == "pending":
             return {"status": "pending", "message": "У вас нет активной подписки."}
 
-        # Привязка или проверка HWID
         if user["hwid"] is None:
             await conn.execute("UPDATE users SET hwid = $1 WHERE username = $2", data.hwid, data.username)
         elif user["hwid"] != data.hwid:
             return {"status": "hwid_mismatch", "message": "HWID не совпадает!"}
 
         return {"status": "ok", "message": "Доступ разрешен."}
+
+@dp.message(Command("start"))
+async def start_cmd(message: types.Message):
+    await message.reply(f"👋 Привет! Бот авторизации работает.\nТвой ID: <code>{message.from_user.id}</code>", parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("sub_give:"))
 async def approve_sub(callback: types.CallbackQuery):
@@ -91,6 +92,3 @@ async def ban_sub(callback: types.CallbackQuery):
         await conn.execute("UPDATE users SET status = 'banned', ban_reason = 'Заблокирован админом' WHERE username = $1", username)
     await callback.message.edit_text(f"⛔ Пользователь <b>{username}</b> заблокирован.", parse_mode="HTML")
     await callback.answer("Забанен!")
-    @dp.message(Command("start"))
-async def start_cmd(message: types.Message):
-    await message.reply(f"👋 Привет! Бот авторизации работает.\nТвой ID: <code>{message.from_user.id}</code>", parse_mode="HTML")
