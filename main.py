@@ -1035,7 +1035,7 @@ dp.include_router(admin)
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global db_pool
-    db_pool = await asyncpg.create_pool(DB_URL)
+   db_pool = await asyncpg.create_pool(DB_URL, statement_cache_size=0)
     await init_db()
     await bot.delete_webhook(drop_pending_updates=True)
     task = asyncio.create_task(dp.start_polling(bot, handle_signals=False))
