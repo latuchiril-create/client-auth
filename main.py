@@ -7,7 +7,7 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Union
-
+          
 import asyncpg
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
@@ -198,9 +198,11 @@ async def init_db():
             details    TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
-        CREATE TABLE IF NOT EXISTS settings (
-            key   TEXT PRIMARY KEY,
-            value TEXT NOT NULL
+            CREATE TABLE IF NOT EXISTS banned_hwids (
+            hwid       TEXT PRIMARY KEY,
+            username   TEXT,
+            reason     TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
         """)
         rows = await conn.fetch("SELECT key, value FROM settings")
