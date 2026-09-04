@@ -3,4 +3,9 @@ uvicorn
 asyncpg
 aiogram>=3.4
 pillow>=10.1
+python-dotenvfastapi
+uvicorn
+asyncpg
+aiogram>=3.4
+pillow>=10.1
 python-dotenv
