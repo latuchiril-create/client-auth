@@ -7,7 +7,7 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Union
-          
+
 import asyncpg
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
@@ -24,7 +24,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (BufferedInputFile, InlineKeyboardButton,
                            InlineKeyboardMarkup, InputMediaPhoto)
 
-try:  # необязательно: .env
+try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
@@ -34,7 +34,7 @@ except ImportError:
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DB_URL = os.getenv("DB_URL")
-API_KEY = os.getenv("API_KEY")                       # опционально: X-Api-Key для /api/auth
+API_KEY = os.getenv("API_KEY")                      # опционально: заголовок X-Api-Key
 TZ = timezone(timedelta(hours=int(os.getenv("TZ_OFFSET", "3"))))
 PAGE_SIZE = 6
 LOG_PAGE_SIZE = 8
@@ -45,29 +45,31 @@ dp = Dispatcher(storage=MemoryStorage())
 admin = Router()
 admin.message.filter(F.from_user.id == ADMIN_ID)
 admin.callback_query.filter(F.from_user.id == ADMIN_ID)
+fallback = Router()
 
 db_pool: Optional[asyncpg.Pool] = None
-SETTINGS: dict[str, str] = {}
+SETTINGS: dict = {}
 DEFAULT_SETTINGS = {
     "auto_approve": "0",   # автоматически одобрять новых
     "maintenance": "0",    # техработы (всем отказ)
-    "hwid_lock": "1",      # проверять HWID
+    "hwid_lock": "1",      # проверять совпадение HWID
+    "hwid_ban": "1",       # бан по HWID (блокировать все ники с этого железа)
     "notify_hwid": "1",    # уведомлять о несовпадении HWID
     "default_days": "30",  # срок подписки при одобрении (0 = навсегда)
 }
-BANNER_CACHE: dict[str, str] = {}     # key -> telegram file_id
-HWID_ALERT_AT: dict[str, datetime] = {}
+BANNER_CACHE: dict = {}      # key -> telegram file_id
+HWID_ALERT_AT: dict = {}
 
 STATUS = {
-    "active":  {"icon": "✅", "name": "Активен",       "theme": "active",  "title": "Active"},
-    "pending": {"icon": "⏳", "name": "Ожидание",      "theme": "pending", "title": "Pending"},
-    "banned":  {"icon": "⛔", "name": "Заблокирован",  "theme": "banned",  "title": "Banned"},
-    "expired": {"icon": "⌛", "name": "Истёк",         "theme": "warn",    "title": "Expired"},
+    "active":  {"icon": "✅", "name": "Активен",      "theme": "active",  "title": "Active"},
+    "pending": {"icon": "⏳", "name": "Ожидание",     "theme": "pending", "title": "Pending"},
+    "banned":  {"icon": "⛔", "name": "Заблокирован", "theme": "banned",  "title": "Banned"},
+    "expired": {"icon": "⌛", "name": "Истёк",        "theme": "warn",    "title": "Expired"},
 }
 ACTION_ICONS = {
     "approve": "✅", "ban": "⛔", "unban": "♻️", "pending": "⏸", "reset_hwid": "🔑",
     "delete": "🗑", "sub": "⏳", "note": "📝", "add": "➕", "new_request": "🔔",
-    "hwid_mismatch": "⚠️", "setting": "⚙️", "bulk": "📦", "export": "📤",
+    "hwid_mismatch": "⚠️", "setting": "⚙️", "bulk": "📦", "export": "📤", "hwid_ban": "🛡",
 }
 
 
@@ -124,6 +126,12 @@ def bar(part: int, total: int, width: int = 10) -> str:
     return "▰" * filled + "▱" * (width - filled)
 
 
+def short_hwid(h: Optional[str], n: int = 14) -> str:
+    if not h:
+        return "—"
+    return h if len(h) <= n else h[:n] + "…"
+
+
 def eff_status(u) -> str:
     if u["status"] == "active" and u["expires_at"] and aware(u["expires_at"]) < now_utc():
         return "expired"
@@ -167,6 +175,39 @@ def default_expiry() -> Optional[datetime]:
     return now_utc() + timedelta(days=days) if days > 0 else None
 
 
+# ---------- бан / разбан по HWID ----------
+async def ban_user(conn, username: str, reason: str) -> int:
+    """Банит ник + его HWID + все твинки с этим HWID. Возвращает число забаненных аккаунтов."""
+    u = await conn.fetchrow("SELECT hwid FROM users WHERE username=$1", username)
+    await conn.execute("UPDATE users SET status='banned', ban_reason=$2 WHERE username=$1", username, reason)
+    count = 1
+    if u and u["hwid"] and flag("hwid_ban"):
+        await conn.execute(
+            "INSERT INTO banned_hwids(hwid, username, reason) VALUES($1,$2,$3) "
+            "ON CONFLICT (hwid) DO UPDATE SET reason=EXCLUDED.reason, username=EXCLUDED.username",
+            u["hwid"], username, reason)
+        res = await conn.execute(
+            "UPDATE users SET status='banned', ban_reason=$2 "
+            "WHERE hwid=$1 AND username<>$3 AND status<>'banned'",
+            u["hwid"], f"{reason} (твинк {username})", username)
+        count += int(res.split()[-1])
+    return count
+
+
+async def unban_user(conn, username: str):
+    """Снимает бан с ника и убирает его HWID из чёрного списка."""
+    u = await conn.fetchrow("SELECT hwid FROM users WHERE username=$1", username)
+    await conn.execute("UPDATE users SET status='active', ban_reason=NULL WHERE username=$1", username)
+    if u and u["hwid"]:
+        await conn.execute("DELETE FROM banned_hwids WHERE hwid=$1", u["hwid"])
+
+
+async def hwid_banned(conn, hwid: str):
+    if not hwid or not flag("hwid_ban"):
+        return None
+    return await conn.fetchrow("SELECT * FROM banned_hwids WHERE hwid=$1", hwid)
+
+
 # ============================ DATABASE ============================
 async def init_db():
     async with db_pool.acquire() as conn:
@@ -198,12 +239,18 @@ async def init_db():
             details    TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
-            CREATE TABLE IF NOT EXISTS banned_hwids (
-            hwid       TEXT PRIMARY KEY,
+        CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS banned_hwids (
+            id         SERIAL PRIMARY KEY,
+            hwid       TEXT UNIQUE NOT NULL,
             username   TEXT,
             reason     TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
+        CREATE INDEX IF NOT EXISTS users_hwid_idx ON users(hwid);
         """)
         rows = await conn.fetch("SELECT key, value FROM settings")
         SETTINGS.update(DEFAULT_SETTINGS)
@@ -219,7 +266,9 @@ async def get_counts(conn) -> dict:
           count(*) FILTER (WHERE {list_where('expired')}) AS expired,
           count(*) AS total
         FROM users""")
-    return dict(row)
+    c = dict(row)
+    c["hwid_bans"] = await conn.fetchval("SELECT count(*) FROM banned_hwids")
+    return c
 
 
 # ============================ BANNER GENERATOR ============================
@@ -235,9 +284,12 @@ THEMES = {  # (тёмный, светлый, акцент)
     "logs":     ((30, 18, 52),  (112, 60, 156), (222, 170, 255)),
     "warn":     ((84, 20, 20),  (204, 62, 30),  (255, 182, 100)),
     "search":   ((8, 52, 62),   (18, 132, 142), (120, 240, 240)),
+    "shield":   ((40, 12, 40),  (140, 30, 110), (255, 140, 220)),
 }
 FONT_CANDIDATES = [
     os.getenv("BANNER_FONT", ""),
+    "fonts/DejaVuSans-Bold.ttf",
+    "fonts/dejavu-sans-bold.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
@@ -250,7 +302,10 @@ FONT_CANDIDATES = [
 def _font(size: int):
     for p in FONT_CANDIDATES:
         if p and os.path.exists(p):
-            return ImageFont.truetype(p, size)
+            try:
+                return ImageFont.truetype(p, size)
+            except Exception:
+                continue
     try:
         return ImageFont.load_default(size=size)
     except TypeError:
@@ -261,7 +316,6 @@ def make_banner(title: str, subtitle: str = "", theme: str = "menu", badge: str 
     W, H = 1200, 480
     c1, c2, accent = THEMES.get(theme, THEMES["menu"])
 
-    # градиент
     base = Image.new("RGB", (W, H), c1)
     d = ImageDraw.Draw(base)
     for x in range(W):
@@ -269,20 +323,17 @@ def make_banner(title: str, subtitle: str = "", theme: str = "menu", badge: str 
         d.line([(x, 0), (x, H)], fill=tuple(int(c1[i] + (c2[i] - c1[i]) * t) for i in range(3)))
     base = base.convert("RGBA")
 
-    # мягкое свечение
     glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     gd = ImageDraw.Draw(glow)
     for cx, cy, r, a in [(W - 140, 70, 260, 80), (220, H + 80, 320, 60), (W // 2, -120, 220, 45)]:
         gd.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(*accent, a))
     base = Image.alpha_composite(base, glow.filter(ImageFilter.GaussianBlur(70)))
 
-    # сетка точек
     d = ImageDraw.Draw(base)
     for gx in range(40, W, 40):
         for gy in range(40, H, 40):
             d.point((gx, gy), fill=(255, 255, 255, 40))
 
-    # стеклянная карточка
     card = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     cd = ImageDraw.Draw(card)
     cd.rounded_rectangle([60, 70, W - 60, H - 70], radius=42,
@@ -290,16 +341,13 @@ def make_banner(title: str, subtitle: str = "", theme: str = "menu", badge: str 
     base = Image.alpha_composite(base, card)
     d = ImageDraw.Draw(base)
 
-    # акцентная полоса
     d.rounded_rectangle([112, 135, 124, H - 135], radius=6, fill=(*accent, 255))
 
-    # заголовок (авто‑подгонка размера)
     size = 92
     title = title.upper()
     while size > 36 and d.textlength(title, font=_font(size)) > W - 340:
         size -= 4
-    f_title = _font(size)
-    d.text((164, 190 - size // 2 - 20), title, font=f_title, fill=(255, 255, 255, 255))
+    d.text((164, 190 - size // 2 - 20), title, font=_font(size), fill=(255, 255, 255, 255))
 
     if subtitle:
         d.text((168, 262), subtitle[:60], font=_font(34), fill=(236, 236, 246, 225))
@@ -330,7 +378,7 @@ Target = Union[types.CallbackQuery, types.Message, tuple]
 
 async def show(target: Target, *, title: str, caption: str, kb: InlineKeyboardMarkup,
                theme: str = "menu", subtitle: str = "", badge: str = ""):
-    """Единая точка рендера: картинка + подпись + клавиатура. Редактирует, если может."""
+    """Единая точка рендера: картинка + подпись + клавиатура."""
     photo, key = await get_banner(title, subtitle, theme, badge)
     media = InputMediaPhoto(media=photo, caption=caption[:1024])
     result = None
@@ -341,7 +389,7 @@ async def show(target: Target, *, title: str, caption: str, kb: InlineKeyboardMa
             except TelegramBadRequest as e:
                 if "not modified" in str(e).lower():
                     return
-                if "file" in str(e).lower():           # протух file_id -> перегенерируем
+                if "file" in str(e).lower():
                     BANNER_CACHE.pop(key, None)
                     photo, key = await get_banner(title, subtitle, theme, badge, fresh=True)
                 try:
@@ -359,6 +407,9 @@ async def show(target: Target, *, title: str, caption: str, kb: InlineKeyboardMa
             except TelegramBadRequest as e:
                 if "not modified" in str(e).lower():
                     return
+                if "file" in str(e).lower():
+                    BANNER_CACHE.pop(key, None)
+                    photo, key = await get_banner(title, subtitle, theme, badge, fresh=True)
                 result = await bot.send_photo(chat_id, photo=photo, caption=caption[:1024], reply_markup=kb)
     finally:
         if isinstance(result, types.Message) and result.photo:
@@ -376,8 +427,8 @@ def kb_main(c: dict) -> InlineKeyboardMarkup:
         [B(f"⛔ Бан ({c['banned']})", "list:banned:0"),     B(f"⌛ Истёкшие ({c['expired']})", "list:expired:0")],
         [B("🔍 Поиск", "search"),                           B("➕ Добавить юзера", "adduser")],
         [B("📊 Статистика", "stats"),                       B("📜 Журнал", "logs:0")],
-        [B("⚙️ Настройки", "settings"),                     B("📤 Экспорт CSV", "export")],
-        [B("🔄 Обновить", "menu")],
+        [B(f"🛡 HWID-баны ({c['hwid_bans']})", "hwidbans:0"), B("📤 Экспорт CSV", "export")],
+        [B("⚙️ Настройки", "settings"),                     B("🔄 Обновить", "menu")],
     ])
 
 
@@ -386,10 +437,10 @@ def kb_user_card(u) -> InlineKeyboardMarkup:
     rows = []
     if st == "pending":
         rows.append([B("✅ Одобрить", f"act:give:{n}"), B("♾ Одобрить навсегда", f"act:giveforever:{n}")])
-        rows.append([B("⛔ Забанить", f"act:ban:{n}"), B("⚡ Быстрый бан", f"act:banq:{n}")])
+        rows.append([B("⛔ Забанить (причина)", f"act:ban:{n}"), B("⚡ Быстрый бан", f"act:banq:{n}")])
     elif st == "active":
         rows.append([B("⏳ Подписка", f"act:sub:{n}"), B("⏸ В ожидание", f"act:topending:{n}")])
-        rows.append([B("⛔ Забанить", f"act:ban:{n}"), B("⚡ Быстрый бан", f"act:banq:{n}")])
+        rows.append([B("⛔ Забанить (причина)", f"act:ban:{n}"), B("⚡ Быстрый бан", f"act:banq:{n}")])
     elif st == "expired":
         rows.append([B("🔁 Продлить", f"act:sub:{n}"), B("♾ Навсегда", f"act:giveforever:{n}")])
         rows.append([B("⏸ В ожидание", f"act:topending:{n}"), B("⛔ Забанить", f"act:ban:{n}")])
@@ -429,7 +480,7 @@ def kb_list(users, status: str, page: int, total: int) -> InlineKeyboardMarkup:
 
 def kb_sub(n: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [B("+7 дн", f"sub:{n}:7"), B("+30 дн", f"sub:{n}:30"), B("+90 дн", f"sub:{n}:90"), B("+180 дн", f"sub:{n}:180")],
+        [B("+7", f"sub:{n}:7"), B("+30", f"sub:{n}:30"), B("+90", f"sub:{n}:90"), B("+180", f"sub:{n}:180")],
         [B("♾ Навсегда", f"sub:{n}:0"), B("✏️ Своё число", f"sub:{n}:custom")],
         [B("⛔ Завершить сейчас", f"sub:{n}:end")],
         [B("◀️ Назад к карточке", f"view:{n}")],
@@ -449,8 +500,8 @@ def kb_settings() -> InlineKeyboardMarkup:
         return B(f"{'🟢' if flag(key) else '🔴'} {label}", f"set:toggle:{key}")
     return InlineKeyboardMarkup(inline_keyboard=[
         [sw("auto_approve", "Автоодобрение")],
-        [sw("hwid_lock", "Проверка HWID"), sw("notify_hwid", "Алерты HWID")],
-        [sw("maintenance", "Режим техработ")],
+        [sw("hwid_lock", "Проверка HWID"), sw("hwid_ban", "Бан по HWID")],
+        [sw("notify_hwid", "Алерты HWID"), sw("maintenance", "Техработы")],
         [B(f"📆 Срок по умолчанию: {get_setting('default_days')} дн", "set:days")],
         [B("🏠 Меню", "menu")],
     ])
@@ -467,6 +518,20 @@ def kb_logs(page: int, total: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[nav, [B("🧹 Очистить журнал", "logs:clear"), B("🏠 Меню", "menu")]])
 
 
+def kb_hwid_bans(rows, page: int, total: int) -> InlineKeyboardMarkup:
+    kb = [[B(f"♻️ {r['username'] or short_hwid(r['hwid'], 10)}", f"hwidban:ask:{r['id']}")] for r in rows]
+    pages = max(1, -(-total // PAGE_SIZE))
+    nav = []
+    if page > 0:
+        nav.append(B("⬅️", f"hwidbans:{page - 1}"))
+    nav.append(B(f"📄 {page + 1}/{pages}", "noop"))
+    if (page + 1) * PAGE_SIZE < total:
+        nav.append(B("➡️", f"hwidbans:{page + 1}"))
+    kb.append(nav)
+    kb.append([B("🏠 Меню", "menu")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
 # ============================ SCREENS ============================
 async def show_menu(target: Target):
     async with db_pool.acquire() as conn:
@@ -477,6 +542,7 @@ async def show_menu(target: Target):
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"✅ Активных: <b>{c['active']}</b>    ⏳ Заявок: <b>{c['pending']}</b>\n"
         f"⛔ В бане: <b>{c['banned']}</b>    ⌛ Истекло: <b>{c['expired']}</b>\n"
+        f"🛡 HWID в чёрном списке: <b>{c['hwid_bans']}</b>\n"
         f"👥 Всего в базе: <b>{c['total']}</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"{system}\n"
@@ -509,6 +575,12 @@ async def show_list(target: Target, status: str, page: int):
 async def show_card(target: Target, username: str, header: str = ""):
     async with db_pool.acquire() as conn:
         u = await conn.fetchrow("SELECT * FROM users WHERE username = $1", username)
+        alts, hb = [], None
+        if u and u["hwid"]:
+            alts = await conn.fetch(
+                "SELECT username, status FROM users WHERE hwid=$1 AND username<>$2 ORDER BY id",
+                u["hwid"], username)
+            hb = await conn.fetchrow("SELECT 1 FROM banned_hwids WHERE hwid=$1", u["hwid"])
     if not u:
         await show(target, title="Not found", theme="warn",
                    caption=f"❌ Пользователь <code>{esc(username)}</code> не найден в базе.",
@@ -516,12 +588,18 @@ async def show_card(target: Target, username: str, header: str = ""):
         return
     st = eff_status(u)
     m = STATUS[st]
+    hwid_line = f"<code>{esc(u['hwid'])}</code>" if u["hwid"] else "<i>не привязан</i>"
     lines = [
         f"👤 <b>{esc(u['username'])}</b>",
         "━━━━━━━━━━━━━━━━━━━━",
         f"📌 Статус: <b>{m['icon']} {m['name']}</b>",
-        f"🔑 HWID: {f'<code>{esc(u[chr(104)+chr(119)+chr(105)+chr(100)])}</code>' if u['hwid'] else '<i>не привязан</i>'}",
+        f"🔑 HWID: {hwid_line}",
     ]
+    if u["hwid"]:
+        lines.append(f"🛡 HWID в чёрном списке: <b>{'да ⛔' if hb else 'нет'}</b>")
+    if alts:
+        alt_txt = ", ".join(f"{STATUS.get(a['status'], {}).get('icon', '•')} {esc(a['username'])}" for a in alts[:8])
+        lines.append(f"🔗 Твинки ({len(alts)}): {alt_txt}")
     if u["status"] == "active":
         exp = "♾ бессрочно" if not u["expires_at"] else f"до {fmt_dt(u['expires_at'])} ({time_left(u['expires_at'])})"
         lines.append(f"⏳ Подписка: <b>{exp}</b>")
@@ -563,7 +641,7 @@ async def show_stats(target: Target):
         f"{row('⏳', 'Заявки', c['pending'])}\n"
         f"{row('⛔', 'Бан', c['banned'])}\n"
         f"{row('⌛', 'Истёкшие', c['expired'])}</code>\n"
-        f"👥 Всего: <b>{t}</b>\n"
+        f"👥 Всего: <b>{t}</b>   🛡 HWID-банов: <b>{c['hwid_bans']}</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"🆕 Новых сегодня: <b>{today}</b>  •  за 7 дней: <b>{week}</b>\n"
         f"🔓 Входов сегодня: <b>{logins_today}</b>  •  всего: <b>{total_logins}</b>\n"
@@ -571,7 +649,8 @@ async def show_stats(target: Target):
         f"⚠️ Истекает в ближайшие 3 дня: <b>{soon}</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"⚙️ Автоодобрение: {'🟢' if flag('auto_approve') else '🔴'}  •  "
-        f"HWID‑lock: {'🟢' if flag('hwid_lock') else '🔴'}  •  "
+        f"HWID-lock: {'🟢' if flag('hwid_lock') else '🔴'}  •  "
+        f"HWID-бан: {'🟢' if flag('hwid_ban') else '🔴'}  •  "
         f"Техработы: {'🟢' if flag('maintenance') else '🔴'}"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -588,7 +667,8 @@ async def show_settings(target: Target):
         "━━━━━━━━━━━━━━━━━━━━\n"
         "🟢 — включено, 🔴 — выключено. Нажмите, чтобы переключить.\n\n"
         "• <b>Автоодобрение</b> — новые юзеры сразу получают доступ\n"
-        "• <b>Проверка HWID</b> — отказ при несовпадении железа\n"
+        "• <b>Проверка HWID</b> — отказ при входе с другого железа\n"
+        "• <b>Бан по HWID</b> — при бане железо уходит в чёрный список, любые новые ники с него банятся\n"
         "• <b>Алерты HWID</b> — уведомлять о попытках с чужого ПК\n"
         "• <b>Техработы</b> — всем клиентам ответ <code>maintenance</code>\n"
         "• <b>Срок по умолчанию</b> — дней подписки при одобрении (0 = навсегда)"
@@ -612,6 +692,24 @@ async def show_logs(target: Target, page: int):
         lines.append(f"{fmt_dt(r['created_at'])} {ico} {esc(r['actor'])}{tgt}{det}")
     await show(target, title="Logs", subtitle=f"{total} records", theme="logs",
                badge=f"page {page + 1}", caption="\n".join(lines), kb=kb_logs(page, total))
+
+
+async def show_hwid_bans(target: Target, page: int):
+    async with db_pool.acquire() as conn:
+        total = await conn.fetchval("SELECT count(*) FROM banned_hwids")
+        rows = await conn.fetch("SELECT * FROM banned_hwids ORDER BY id DESC LIMIT $1 OFFSET $2",
+                                PAGE_SIZE, page * PAGE_SIZE)
+    lines = ["🛡 <b>Чёрный список HWID</b>", "━━━━━━━━━━━━━━━━━━━━",
+             f"Всего: <b>{total}</b>. Любой ник с этого железа сразу получает бан.", ""]
+    if not rows:
+        lines.append("<i>Пусто.</i>")
+    for r in rows:
+        lines.append(f"• <b>{esc(r['username'] or '—')}</b> — <code>{esc(short_hwid(r['hwid'], 20))}</code>\n"
+                     f"   <i>{esc(r['reason'] or 'без причины')}</i> · {fmt_dt(r['created_at'], False)}")
+    if rows:
+        lines.append("\nНажмите на ник ниже, чтобы снять HWID-бан 👇")
+    await show(target, title="HWID bans", subtitle=f"{total} devices", theme="shield",
+               badge=f"page {page + 1}", caption="\n".join(lines), kb=kb_hwid_bans(rows, page, total))
 
 
 # ============================ BOT: COMMANDS ============================
@@ -688,7 +786,7 @@ async def cb_action(cb: types.CallbackQuery, state: FSMContext):
     if action == "delete":
         await show(cb, title="Delete?", subtitle=n, theme="warn", badge="Danger",
                    caption=(f"⚠️ <b>Удалить пользователя</b> <code>{esc(n)}</code> из базы?\n\n"
-                            "Это действие <b>необратимо</b>. HWID, заметки и история будут потеряны."),
+                            "Это действие <b>необратимо</b>. HWID-бан (если был) останется в чёрном списке."),
                    kb=kb_confirm(f"do:delete:{n}", f"view:{n}", "🗑 Да, удалить"))
         await cb.answer()
         return
@@ -697,7 +795,9 @@ async def cb_action(cb: types.CallbackQuery, state: FSMContext):
         await start_input(cb, state, Form.ban_reason, username=n, title="Ban reason", theme="banned",
                           caption=(f"⛔ <b>Бан пользователя</b> <code>{esc(n)}</code>\n\n"
                                    "✍️ Отправьте <b>причину блокировки</b> сообщением.\n"
-                                   "Она будет показана пользователю в клиенте."))
+                                   "Она будет показана пользователю в клиенте.\n"
+                                   + ("🛡 Его HWID уйдёт в чёрный список, твинки тоже забанятся."
+                                      if flag("hwid_ban") else "")))
         return
 
     if action == "note":
@@ -706,7 +806,6 @@ async def cb_action(cb: types.CallbackQuery, state: FSMContext):
                                    "✍️ Отправьте текст заметки. Отправьте <code>-</code>, чтобы удалить."))
         return
 
-    # --- мгновенные действия ---
     async with db_pool.acquire() as conn:
         if action == "give":
             await conn.execute("UPDATE users SET status='active', ban_reason=NULL, expires_at=$2 WHERE username=$1",
@@ -718,13 +817,13 @@ async def cb_action(cb: types.CallbackQuery, state: FSMContext):
             await log_action("admin", "approve", n, "forever")
             msg = "♾ Доступ выдан навсегда"
         elif action == "unban":
-            await conn.execute("UPDATE users SET status='active', ban_reason=NULL WHERE username=$1", n)
+            await unban_user(conn, n)
             await log_action("admin", "unban", n)
-            msg = "♻️ Разбанен"
+            msg = "♻️ Разбанен, HWID убран из чёрного списка"
         elif action == "banq":
-            await conn.execute("UPDATE users SET status='banned', ban_reason='Заблокирован администратором' WHERE username=$1", n)
-            await log_action("admin", "ban", n, "quick")
-            msg = "⚡ Забанен"
+            cnt = await ban_user(conn, n, "Заблокирован администратором")
+            await log_action("admin", "ban", n, f"quick, {cnt} acc")
+            msg = f"⚡ Забанен по HWID ({cnt} акк.)" if flag("hwid_ban") else "⚡ Забанен"
         elif action == "topending":
             await conn.execute("UPDATE users SET status='pending', ban_reason=NULL WHERE username=$1", n)
             await log_action("admin", "pending", n)
@@ -735,7 +834,7 @@ async def cb_action(cb: types.CallbackQuery, state: FSMContext):
             msg = "🔑 HWID сброшен"
         else:
             msg = "❓ Неизвестное действие"
-    await cb.answer(msg, show_alert=False)
+    await cb.answer(msg)
     await show_card(cb, n, header=f"<b>{msg}</b>")
 
 
@@ -747,6 +846,16 @@ async def cb_do_delete(cb: types.CallbackQuery):
     await log_action("admin", "delete", n)
     await cb.answer("🗑 Пользователь удалён", show_alert=True)
     await show_menu(cb)
+
+
+async def apply_days(conn, n: str, days: int):
+    u = await conn.fetchrow("SELECT expires_at FROM users WHERE username=$1", n)
+    base = now_utc()
+    if u and u["expires_at"] and aware(u["expires_at"]) > base:
+        base = aware(u["expires_at"])
+    await conn.execute("UPDATE users SET status='active', ban_reason=NULL, expires_at=$2 WHERE username=$1",
+                       n, base + timedelta(days=days))
+    await log_action("admin", "sub", n, f"+{days}d")
 
 
 @admin.callback_query(F.data.startswith("sub:"))
@@ -774,14 +883,49 @@ async def cb_sub(cb: types.CallbackQuery, state: FSMContext):
     await show_card(cb, n, header=f"<b>{msg}</b>")
 
 
-async def apply_days(conn, n: str, days: int):
-    u = await conn.fetchrow("SELECT expires_at FROM users WHERE username=$1", n)
-    base = now_utc()
-    if u and u["expires_at"] and aware(u["expires_at"]) > base:
-        base = aware(u["expires_at"])
-    await conn.execute("UPDATE users SET status='active', ban_reason=NULL, expires_at=$2 WHERE username=$1",
-                       n, base + timedelta(days=days))
-    await log_action("admin", "sub", n, f"+{days}d")
+# ============================ BOT: HWID BANS ============================
+@admin.callback_query(F.data.startswith("hwidbans:"))
+async def cb_hwidbans(cb: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await show_hwid_bans(cb, int(cb.data.split(":")[1]))
+    await cb.answer()
+
+
+@admin.callback_query(F.data.startswith("hwidban:"))
+async def cb_hwidban(cb: types.CallbackQuery):
+    _, op, rid = cb.data.split(":")
+    rid = int(rid)
+    async with db_pool.acquire() as conn:
+        r = await conn.fetchrow("SELECT * FROM banned_hwids WHERE id=$1", rid)
+        if not r:
+            await cb.answer("Запись уже удалена", show_alert=True)
+            await show_hwid_bans(cb, 0)
+            return
+        if op == "ask":
+            cnt = await conn.fetchval("SELECT count(*) FROM users WHERE hwid=$1 AND status='banned'", r["hwid"])
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [B(f"♻️ Убрать HWID + разбанить всех ({cnt})", f"hwidban:all:{rid}")],
+                [B("🛡 Убрать только HWID из списка", f"hwidban:only:{rid}")],
+                [B("◀️ Назад", "hwidbans:0")],
+            ])
+            await show(cb, title="Unban HWID", subtitle=r["username"] or "", theme="shield", badge="Confirm",
+                       caption=(f"🛡 <b>HWID:</b> <code>{esc(r['hwid'])}</code>\n"
+                                f"👤 Ник при бане: <b>{esc(r['username'] or '—')}</b>\n"
+                                f"🚫 Причина: <i>{esc(r['reason'] or '—')}</i>\n"
+                                f"⛔ Забаненных аккаунтов с этим железом: <b>{cnt}</b>\n\nЧто сделать?"),
+                       kb=kb)
+            await cb.answer()
+            return
+        await conn.execute("DELETE FROM banned_hwids WHERE id=$1", rid)
+        if op == "all":
+            res = await conn.execute(
+                "UPDATE users SET status='active', ban_reason=NULL WHERE hwid=$1 AND status='banned'", r["hwid"])
+            await log_action("admin", "unban", r["username"], f"hwid + {res}")
+            await cb.answer(f"♻️ HWID убран, разбанено: {res.split()[-1]}", show_alert=True)
+        else:
+            await log_action("admin", "unban", r["username"], "hwid only")
+            await cb.answer("🛡 HWID убран из чёрного списка")
+    await show_hwid_bans(cb, 0)
 
 
 # ============================ BOT: BULK ============================
@@ -802,7 +946,8 @@ async def cb_bulk(cb: types.CallbackQuery):
             await cb.answer()
             return
         async with db_pool.acquire() as conn:
-            res = await conn.execute("UPDATE users SET status='active', expires_at=$1 WHERE status='pending'", default_expiry())
+            res = await conn.execute("UPDATE users SET status='active', expires_at=$1 WHERE status='pending'",
+                                     default_expiry())
         await log_action("admin", "bulk", None, f"approve_pending {res}")
         await cb.answer(f"✅ Готово: {res}", show_alert=True)
         await show_list(cb, "active", 0)
@@ -815,7 +960,8 @@ async def cb_bulk(cb: types.CallbackQuery):
             await cb.answer()
             return
         async with db_pool.acquire() as conn:
-            res = await conn.execute(f"UPDATE users SET status='pending', expires_at=NULL WHERE {list_where('expired')}")
+            res = await conn.execute(
+                f"UPDATE users SET status='pending', expires_at=NULL WHERE {list_where('expired')}")
         await log_action("admin", "bulk", None, f"expired_to_pending {res}")
         await cb.answer(f"⏸ Готово: {res}", show_alert=True)
         await show_list(cb, "pending", 0)
@@ -837,7 +983,7 @@ async def cb_set(cb: types.CallbackQuery, state: FSMContext):
         await set_setting(key, new)
         await log_action("admin", "setting", key, new)
         await show_settings(cb)
-        await cb.answer(f"{'🟢 Включено' if new == '1' else '🔴 Выключено'}")
+        await cb.answer("🟢 Включено" if new == "1" else "🔴 Выключено")
     elif parts[1] == "days":
         await start_input(cb, state, Form.default_days, title="Default days", theme="settings",
                           caption=("📆 <b>Срок подписки по умолчанию</b>\n\n"
@@ -972,10 +1118,11 @@ async def fsm_ban_reason(message: types.Message, state: FSMContext):
     data, panel = await take_input(message, state)
     n = data["username"]
     async with db_pool.acquire() as conn:
-        await conn.execute("UPDATE users SET status='banned', ban_reason=$2 WHERE username=$1", n, reason)
-    await log_action("admin", "ban", n, reason)
+        cnt = await ban_user(conn, n, reason)
+    await log_action("admin", "ban", n, f"{reason} ({cnt} acc)")
     await state.clear()
-    await show_card(panel, n, header="⛔ <b>Пользователь заблокирован</b>")
+    hdr = f"⛔ <b>Заблокирован по HWID — {cnt} акк.</b>" if flag("hwid_ban") else "⛔ <b>Заблокирован</b>"
+    await show_card(panel, n, header=hdr)
 
 
 @admin.message(Form.note)
@@ -998,7 +1145,7 @@ async def fsm_sub_days(message: types.Message, state: FSMContext):
     if not txt.isdigit() or not (1 <= int(txt) <= 3650):
         await show(panel, title="Custom days", subtitle=n, theme="warn", badge="Error",
                    caption="❌ Введите целое число от 1 до 3650.", kb=kb_cancel())
-        return  # состояние остаётся, ждём ещё
+        return
     async with db_pool.acquire() as conn:
         await apply_days(conn, n, int(txt))
     await state.clear()
@@ -1019,12 +1166,10 @@ async def fsm_default_days(message: types.Message, state: FSMContext):
     await show_settings(panel)
 
 
-# ---- всё, что не админ ----
-fallback = Router()
-
-
+# ============================ НЕ АДМИН ============================
 @fallback.message()
 async def not_admin_msg(message: types.Message):
+    print(f"[DENY] from_user.id={message.from_user.id}, ADMIN_ID={ADMIN_ID}")
     await message.answer("⛔ <b>Доступ запрещён.</b>\nЭта панель только для администратора.")
 
 
@@ -1034,14 +1179,14 @@ async def not_admin_cb(cb: types.CallbackQuery):
 
 
 dp.include_router(admin)      # сначала админ
-dp.include_router(fallback)   # потом заглушка для остальных
+dp.include_router(fallback)   # потом заглушка
 
 
 # ============================ FASTAPI ============================
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global db_pool
-    db_pool = await asyncpg.create_pool(DB_URL, statement_cache_size=0)
+    db_pool = await asyncpg.create_pool(DB_URL, statement_cache_size=0)  # совместимо с pooler Supabase
     await init_db()
     await bot.delete_webhook(drop_pending_updates=True)
     task = asyncio.create_task(dp.start_polling(bot, handle_signals=False))
@@ -1112,7 +1257,7 @@ async def auth(data: AuthRequest, x_api_key: Optional[str] = Header(default=None
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="bad api key")
 
-    username, hwid = data.username.strip()[:32], data.hwid.strip()[:128]
+    username, hwid = data.username.strip()[:32], data.hwid.strip()[:256]
     if not username or not hwid:
         raise HTTPException(status_code=400, detail="username/hwid required")
 
@@ -1121,6 +1266,22 @@ async def auth(data: AuthRequest, x_api_key: Optional[str] = Header(default=None
 
     async with db_pool.acquire() as conn:
         user = await conn.fetchrow("SELECT * FROM users WHERE username = $1", username)
+
+        # ---- HWID в чёрном списке → бан любому нику с этого железа ----
+        hb = await hwid_banned(conn, hwid)
+        if hb:
+            reason = hb["reason"] or "Вы заблокированы."
+            twin_reason = f"{reason} (твинк {hb['username']})" if hb["username"] and hb["username"] != username else reason
+            if not user:
+                await conn.execute(
+                    "INSERT INTO users (username, hwid, status, ban_reason) VALUES ($1,$2,'banned',$3)",
+                    username, hwid, twin_reason)
+                await log_action("api", "hwid_ban", username, f"alt of {hb['username']}")
+            elif user["status"] != "banned":
+                await conn.execute("UPDATE users SET status='banned', ban_reason=$2 WHERE username=$1",
+                                   username, twin_reason)
+                await log_action("api", "hwid_ban", username, f"alt of {hb['username']}")
+            return {"status": "banned", "message": reason}
 
         # ---- новый пользователь ----
         if not user:
@@ -1136,16 +1297,22 @@ async def auth(data: AuthRequest, x_api_key: Optional[str] = Header(default=None
             asyncio.create_task(notify_new_request(u))
             return {"status": "pending", "message": "Заявка отправлена. Ожидайте одобрения."}
 
-        # ---- статусы ----
+        # ---- забанен по нику → на всякий случай заносим его железо в чёрный список ----
         if user["status"] == "banned":
+            if flag("hwid_ban"):
+                await conn.execute(
+                    "INSERT INTO banned_hwids(hwid, username, reason) VALUES($1,$2,$3) ON CONFLICT (hwid) DO NOTHING",
+                    hwid, username, user["ban_reason"])
             return {"status": "banned", "message": user["ban_reason"] or "Вы заблокированы."}
+
         if user["status"] == "pending":
             return {"status": "pending", "message": "Подписка ещё не одобрена."}
+
         if user["expires_at"] and aware(user["expires_at"]) < now_utc():
             return {"status": "expired", "message": "Срок подписки истёк.",
                     "expires_at": user["expires_at"].isoformat()}
 
-        # ---- HWID ----
+        # ---- HWID привязка / проверка ----
         if not user["hwid"]:
             await conn.execute("UPDATE users SET hwid = $1 WHERE username = $2", hwid, username)
         elif flag("hwid_lock") and user["hwid"] != hwid:
