@@ -1018,17 +1018,21 @@ async def fsm_default_days(message: types.Message, state: FSMContext):
 
 
 # ---- всё, что не админ ----
-@dp.message()
+fallback = Router()
+
+
+@fallback.message()
 async def not_admin_msg(message: types.Message):
     await message.answer("⛔ <b>Доступ запрещён.</b>\nЭта панель только для администратора.")
 
 
-@dp.callback_query()
+@fallback.callback_query()
 async def not_admin_cb(cb: types.CallbackQuery):
     await cb.answer("⛔ Доступ запрещён", show_alert=True)
 
 
-dp.include_router(admin)
+dp.include_router(admin)      # сначала админ
+dp.include_router(fallback)   # потом заглушка для остальных
 
 
 # ============================ FASTAPI ============================
