@@ -10,6 +10,7 @@ from typing import Optional, Union
 
 import asyncpg
 import hashlib
+import secrets
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
@@ -1473,14 +1474,16 @@ async def auth(data: AuthRequest, x_api_key: Optional[str] = Header(default=None
             return {"status": "expired", "message": "Срок подписки истёк.",
                     "expires_at": user["expires_at"].isoformat()}
 
-        # ---- HWID привязка / проверка ----
-        if not user["hwid"]:
-            await conn.execute("UPDATE users SET hwid = $1 WHERE id = $2", hwid, user["id"])
-        elif flag("hwid_lock") and user["hwid"] != hwid:
-            await log_action("api", "hwid_mismatch", username, hwid[:40])
-            if flag("notify_hwid"):
-                asyncio.create_task(notify_hwid_mismatch(user, hwid))
-            return {"status": "hwid_mismatch", "message": "HWID не совпадает с привязанным!"}
+        # ---- HWID привязка / проверка (СТРОГО для реального клиента/лаунчера, сайт с WEB_ не проверяет HWID) ----
+        is_web_req = hwid.startswith("WEB_") or hwid == "WEB"
+        if not is_web_req:
+            if not user["hwid"] or user["hwid"].startswith("WEB_"):
+                await conn.execute("UPDATE users SET hwid = $1 WHERE id = $2", hwid, user["id"])
+            elif flag("hwid_lock") and user["hwid"] != hwid:
+                await log_action("api", "hwid_mismatch", username, hwid[:40])
+                if flag("notify_hwid"):
+                    asyncio.create_task(notify_hwid_mismatch(user, hwid))
+                return {"status": "hwid_mismatch", "message": "HWID не совпадает с привязанным!"}
 
         await conn.execute("UPDATE users SET last_login=now(), login_count=login_count+1 WHERE id=$1", user["id"])
 
@@ -1516,6 +1519,7 @@ class AdminUserActionRequest(BaseModel):
     username: str
     reason: Optional[str] = None
     days: Optional[int] = 30
+    role: Optional[str] = None
 
 
 @app.post("/api/client/redeem")
@@ -1638,6 +1642,29 @@ async def admin_reset_hwid_api(data: AdminUserActionRequest, authorization: Opti
         await conn.execute("UPDATE users SET hwid=NULL WHERE LOWER(username)=LOWER($1)", data.username)
         await log_action("admin_api", "reset_hwid", data.username)
     return {"success": True, "message": f"HWID для {data.username} успешно сброшен"}
+
+
+@app.post("/api/admin/revoke-sub")
+async def admin_revoke_sub_api(data: AdminUserActionRequest, authorization: Optional[str] = Header(default=None)):
+    secret = (authorization or "").replace("Bearer ", "").strip()
+    if secret != "fuga_admin_secret_key_2026" and (not API_KEY or secret != API_KEY):
+        raise HTTPException(status_code=403, detail="Invalid admin secret")
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE users SET status='pending', expires_at=NULL WHERE LOWER(username)=LOWER($1)", data.username)
+        await log_action("admin_api", "revoke_sub", data.username)
+    return {"success": True, "message": f"Подписка у {data.username} успешно аннулирована"}
+
+
+@app.post("/api/admin/set-role")
+async def admin_set_role_api(data: AdminUserActionRequest, authorization: Optional[str] = Header(default=None)):
+    secret = (authorization or "").replace("Bearer ", "").strip()
+    if secret != "fuga_admin_secret_key_2026" and (not API_KEY or secret != API_KEY):
+        raise HTTPException(status_code=403, detail="Invalid admin secret")
+    role = (data.role or "User").strip()
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE users SET note=$1 WHERE LOWER(username)=LOWER($2)", f"ROLE:{role}", data.username)
+        await log_action("admin_api", "set_role", data.username, role)
+    return {"success": True, "message": f"Пользователю {data.username} присвоен префикс [{role}]"}
 
 
 @app.get("/api/admin/stats")
