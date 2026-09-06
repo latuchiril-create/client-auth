@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, Union
 
 import asyncpg
+import hashlib
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
@@ -224,12 +225,14 @@ async def init_db():
             login_count INTEGER NOT NULL DEFAULT 0,
             created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
         );
-        ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_reason  TEXT;
-        ALTER TABLE users ADD COLUMN IF NOT EXISTS note        TEXT;
-        ALTER TABLE users ADD COLUMN IF NOT EXISTS expires_at  TIMESTAMPTZ;
-        ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login  TIMESTAMPTZ;
-        ALTER TABLE users ADD COLUMN IF NOT EXISTS login_count INTEGER NOT NULL DEFAULT 0;
-        ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at  TIMESTAMPTZ NOT NULL DEFAULT now();
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_reason     TEXT;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS note           TEXT;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS expires_at     TIMESTAMPTZ;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login     TIMESTAMPTZ;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS login_count    INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at     TIMESTAMPTZ NOT NULL DEFAULT now();
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash  TEXT;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS email          TEXT;
 
         CREATE TABLE IF NOT EXISTS action_log (
             id         SERIAL PRIMARY KEY,
@@ -1202,14 +1205,23 @@ app = FastAPI(title="License Control API", lifespan=lifespan)
 class AuthRequest(BaseModel):
     username: str
     hwid: str
+    password: Optional[str] = None
+
+
+class RegisterRequest(BaseModel):
+    username: str
+    password: str
+    email: Optional[str] = ""
+    hwid: str
 
 
 async def notify_new_request(u):
     try:
+        email_str = f"\n📧 Почта: <code>{esc(u.get('email') or '—')}</code>" if u.get('email') else ""
         caption = (
             "🔔 <b>Новая заявка на доступ!</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            f"👤 Ник: <code>{esc(u['username'])}</code>\n"
+            f"👤 Ник: <code>{esc(u['username'])}</code>{email_str}\n"
             f"🔑 HWID: <code>{esc(u['hwid'])}</code>\n"
             f"🕒 {fmt_dt(u['created_at'])}"
         )
@@ -1252,6 +1264,51 @@ async def health():
     return {"ok": True, "time": now_utc().isoformat()}
 
 
+@app.post("/api/register")
+async def register(data: RegisterRequest, x_api_key: Optional[str] = Header(default=None)):
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="bad api key")
+
+    username = data.username.strip()[:32]
+    password = data.password.strip()
+    email = (data.email or "").strip()[:64]
+    hwid = data.hwid.strip()[:256]
+
+    if not username or len(username) < 3:
+        raise HTTPException(status_code=400, detail="Логин должен быть от 3 символов")
+    if not password or len(password) < 4:
+        raise HTTPException(status_code=400, detail="Пароль должен быть не менее 4 символов")
+    if not hwid:
+        raise HTTPException(status_code=400, detail="hwid required")
+
+    pw_hash = hashlib.sha256(password.encode()).hexdigest()
+
+    async with db_pool.acquire() as conn:
+        # HWID blacklist check
+        hb = await hwid_banned(conn, hwid)
+        if hb:
+            return {"status": "banned", "message": hb["reason"] or "Ваше оборудование заблокировано."}
+
+        exists = await conn.fetchval("SELECT 1 FROM users WHERE username = $1", username)
+        if exists:
+            return {"status": "already_exists", "message": "Пользователь с таким логином уже зарегистрирован."}
+
+        auto = flag("auto_approve")
+        u = await conn.fetchrow(
+            "INSERT INTO users (username, password_hash, email, hwid, status, expires_at) "
+            "VALUES ($1, $2, $3, $4, $5, $6) RETURNING *",
+            username, pw_hash, email, hwid, "active" if auto else "pending", default_expiry() if auto else None
+        )
+        await log_action("api", "register", username, email or "no email")
+        if not auto:
+            asyncio.create_task(notify_new_request(u))
+
+    return {
+        "status": "ok",
+        "message": "Регистрация успешна! Заявка отправлена администратору в Telegram на рассмотрение."
+    }
+
+
 @app.post("/api/auth")
 async def auth(data: AuthRequest, x_api_key: Optional[str] = Header(default=None)):
     if API_KEY and x_api_key != API_KEY:
@@ -1283,19 +1340,18 @@ async def auth(data: AuthRequest, x_api_key: Optional[str] = Header(default=None
                 await log_action("api", "hwid_ban", username, f"alt of {hb['username']}")
             return {"status": "banned", "message": reason}
 
-        # ---- новый пользователь ----
+        # ---- пользователь не существует -> НЕ создаем автоматически! ----
         if not user:
-            auto = flag("auto_approve")
-            u = await conn.fetchrow(
-                "INSERT INTO users (username, hwid, status, expires_at) VALUES ($1, $2, $3, $4) RETURNING *",
-                username, hwid, "active" if auto else "pending", default_expiry() if auto else None)
-            await log_action("api", "new_request", username, "auto-approved" if auto else None)
-            if auto:
-                await conn.execute("UPDATE users SET last_login=now(), login_count=1 WHERE username=$1", username)
-                return {"status": "ok", "message": "Доступ разрешён.",
-                        "expires_at": u["expires_at"].isoformat() if u["expires_at"] else None}
-            asyncio.create_task(notify_new_request(u))
-            return {"status": "pending", "message": "Заявка отправлена. Ожидайте одобрения."}
+            return {"status": "not_found", "message": "Пользователь не найден. Зарегистрируйтесь."}
+
+        # ---- проверка пароля (если передан лаунчером) ----
+        if data.password:
+            pw_hash = hashlib.sha256(data.password.strip().encode()).hexdigest()
+            if user["password_hash"] and user["password_hash"] != pw_hash:
+                return {"status": "invalid_password", "message": "Неверный пароль."}
+            elif not user["password_hash"]:
+                # При первом входе без пароля у старых юзеров привязываем введенный пароль
+                await conn.execute("UPDATE users SET password_hash = $1 WHERE username = $2", pw_hash, username)
 
         # ---- забанен по нику → на всякий случай заносим его железо в чёрный список ----
         if user["status"] == "banned":
@@ -1306,7 +1362,7 @@ async def auth(data: AuthRequest, x_api_key: Optional[str] = Header(default=None
             return {"status": "banned", "message": user["ban_reason"] or "Вы заблокированы."}
 
         if user["status"] == "pending":
-            return {"status": "pending", "message": "Подписка ещё не одобрена."}
+            return {"status": "pending", "message": "Подписка ещё не одобрена администратором."}
 
         if user["expires_at"] and aware(user["expires_at"]) < now_utc():
             return {"status": "expired", "message": "Срок подписки истёк.",
