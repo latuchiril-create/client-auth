@@ -1411,6 +1411,9 @@ async def register(data: RegisterRequest, x_api_key: Optional[str] = Header(defa
 
     return {
         "status": "ok",
+        "user_status": "active" if auto else "pending",
+        "expires_at": u["expires_at"].isoformat() if u and u["expires_at"] else None,
+        "days_left": int(get_setting("default_days") or 30) if auto else None,
         "message": "Регистрация успешна!"
     }
 
