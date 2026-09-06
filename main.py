@@ -1468,11 +1468,12 @@ async def auth(data: AuthRequest, x_api_key: Optional[str] = Header(default=None
             return {"status": "banned", "message": user["ban_reason"] or "Вы заблокированы."}
 
         if user["status"] == "pending":
-            return {"status": "pending", "message": "Подписка ещё не одобрена администратором."}
+            return {"status": "pending", "message": "Подписка ещё не одобрена администратором.", "note": user["note"] or None}
 
         if user["expires_at"] and aware(user["expires_at"]) < now_utc():
             return {"status": "expired", "message": "Срок подписки истёк.",
-                    "expires_at": user["expires_at"].isoformat()}
+                    "expires_at": user["expires_at"].isoformat(),
+                    "note": user["note"] or None}
 
         # ---- HWID привязка / проверка (СТРОГО для реального клиента/лаунчера, сайт с WEB_ не проверяет HWID) ----
         is_web_req = hwid.startswith("WEB_") or hwid == "WEB"
@@ -1492,7 +1493,8 @@ async def auth(data: AuthRequest, x_api_key: Optional[str] = Header(default=None
         days_left = max(0, (aware(user["expires_at"]) - now_utc()).days)
     return {"status": "ok", "message": "Доступ разрешён.",
             "expires_at": user["expires_at"].isoformat() if user["expires_at"] else None,
-            "days_left": days_left}
+            "days_left": days_left,
+            "note": user["note"] or None}
 
 
 # ============================ KEYS & ADMIN API ============================
@@ -1593,7 +1595,7 @@ async def admin_get_users(authorization: Optional[str] = Header(default=None)):
     if secret != "fuga_admin_secret_key_2026" and (not API_KEY or secret != API_KEY):
         raise HTTPException(status_code=403, detail="Invalid admin secret")
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT id, username, hwid, status, expires_at, created_at, last_login, login_count, ban_reason FROM users ORDER BY id DESC LIMIT 500")
+        rows = await conn.fetch("SELECT id, username, hwid, status, expires_at, created_at, last_login, login_count, ban_reason, note FROM users ORDER BY id DESC LIMIT 500")
         return [dict(r) for r in rows]
 
 
@@ -1608,6 +1610,28 @@ async def admin_approve_user(data: AdminUserActionRequest, authorization: Option
         await conn.execute("UPDATE users SET status='active', expires_at=$1 WHERE LOWER(username)=LOWER($2)", exp, data.username)
         await log_action("admin_api", "approve", data.username, f"{days}d")
     return {"success": True, "message": f"Пользователь {data.username} одобрен на {days} дней"}
+
+
+@app.post("/api/admin/reject-user")
+async def admin_reject_user_api(data: AdminUserActionRequest, authorization: Optional[str] = Header(default=None)):
+    secret = (authorization or "").replace("Bearer ", "").strip()
+    if secret != "fuga_admin_secret_key_2026" and (not API_KEY or secret != API_KEY):
+        raise HTTPException(status_code=403, detail="Invalid admin secret")
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM users WHERE LOWER(username)=LOWER($1)", data.username)
+        await log_action("admin_api", "delete", data.username, "rejected application")
+    return {"success": True, "message": f"Заявка пользователя {data.username} отклонена и удалена из базы"}
+
+
+@app.post("/api/admin/delete-user")
+async def admin_delete_user_api(data: AdminUserActionRequest, authorization: Optional[str] = Header(default=None)):
+    secret = (authorization or "").replace("Bearer ", "").strip()
+    if secret != "fuga_admin_secret_key_2026" and (not API_KEY or secret != API_KEY):
+        raise HTTPException(status_code=403, detail="Invalid admin secret")
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM users WHERE LOWER(username)=LOWER($1)", data.username)
+        await log_action("admin_api", "delete", data.username)
+    return {"success": True, "message": f"Пользователь {data.username} удалён из базы"}
 
 
 @app.post("/api/admin/ban-user")
@@ -1665,6 +1689,26 @@ async def admin_set_role_api(data: AdminUserActionRequest, authorization: Option
         await conn.execute("UPDATE users SET note=$1 WHERE LOWER(username)=LOWER($2)", f"ROLE:{role}", data.username)
         await log_action("admin_api", "set_role", data.username, role)
     return {"success": True, "message": f"Пользователю {data.username} присвоен префикс [{role}]"}
+
+
+@app.get("/api/admin/settings")
+async def admin_get_settings_api(authorization: Optional[str] = Header(default=None)):
+    secret = (authorization or "").replace("Bearer ", "").strip()
+    if secret != "fuga_admin_secret_key_2026" and (not API_KEY or secret != API_KEY):
+        raise HTTPException(status_code=403, detail="Invalid admin secret")
+    return {"success": True, "settings": {k: get_setting(k) for k in DEFAULT_SETTINGS}}
+
+
+@app.post("/api/admin/settings")
+async def admin_update_settings_api(data: dict, authorization: Optional[str] = Header(default=None)):
+    secret = (authorization or "").replace("Bearer ", "").strip()
+    if secret != "fuga_admin_secret_key_2026" and (not API_KEY or secret != API_KEY):
+        raise HTTPException(status_code=403, detail="Invalid admin secret")
+    for k, v in data.items():
+        if k in DEFAULT_SETTINGS:
+            await set_setting(k, str(v))
+    await log_action("admin_api", "update_settings", details=str(data))
+    return {"success": True, "settings": {k: get_setting(k) for k in DEFAULT_SETTINGS}}
 
 
 @app.get("/api/admin/stats")
