@@ -1208,13 +1208,19 @@ from pathlib import Path
 
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.exceptions import InvalidTag
 from fastapi import Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
-CLIENT_MANIFEST_PATH = os.getenv("CLIENT_MANIFEST_PATH", "")
+CLIENT_MANIFEST_PATH = os.getenv("CLIENT_MANIFEST_PATH", str(Path(__file__).resolve().parent / "release" / "manifest.json"))
 CLIENT_ARTIFACT_PATH = os.getenv("CLIENT_ARTIFACT_PATH", "")
+CLIENT_ENCRYPTED_PARTS_DIR = os.getenv("CLIENT_ENCRYPTED_PARTS_DIR", str(Path(__file__).resolve().parent / "release" / "parts"))
+CLIENT_ARTIFACT_KEY_B64 = os.getenv("CLIENT_ARTIFACT_KEY_B64", "")
+LICENSE_ASSERTION_SEED_B64 = os.getenv("LICENSE_ASSERTION_SEED_B64", "")
 PASSWORD_HASHER = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=4)
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,32}$")
 _attempts: dict[str, list[float]] = {}
@@ -1342,8 +1348,9 @@ async def license_result(conn, user, hwid: str, *, may_bind: bool) -> dict:
         stored = await conn.fetchval("SELECT hwid FROM users WHERE id=$1", user["id"])
     if flag("hwid_lock") and stored != hwid:
         return {"status": "hwid_mismatch"}
-    return {"status": "ok", "username": user["username"],
-            "expires_at": expires.isoformat() if expires else None}
+    return {"status": "ok", "username": user["username"], "role": user["role"],
+            "expires_at": expires.isoformat() if expires else None,
+            "days_left": max(0, (expires - now_utc()).days) if expires else None}
 
 
 @asynccontextmanager
@@ -1399,6 +1406,10 @@ class CreateKeyRequest(BaseModel):
     count: int = 1
     prefix: str = "FLUX"
     plan: str = "licensed"
+
+
+class DeleteKeysRequest(BaseModel):
+    keys: list[str]
 
 
 class AdminUserActionRequest(BaseModel):
@@ -1550,6 +1561,27 @@ async def active_loader_session(authorization: Optional[str]):
     return user
 
 
+@app.get("/api/client/license-assertion")
+async def license_assertion(authorization: Optional[str] = Header(default=None)):
+    user = await active_loader_session(authorization)
+    if not LICENSE_ASSERTION_SEED_B64:
+        raise HTTPException(status_code=503, detail="License assertion signer is not configured")
+    try:
+        seed = base64.b64decode(LICENSE_ASSERTION_SEED_B64, validate=True)
+        signer = Ed25519PrivateKey.from_private_bytes(seed)
+    except (ValueError, binascii.Error):
+        raise HTTPException(status_code=503, detail="License assertion signer is invalid")
+    payload = json.dumps({
+        "username": user["username"],
+        "hwid": user["session_hwid"],
+        "exp": int(time.time()) + 20,
+    }, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return JSONResponse({
+        "payload": base64.b64encode(payload).decode("ascii"),
+        "signature": base64.b64encode(signer.sign(payload)).decode("ascii"),
+    }, headers={"Cache-Control": "no-store"})
+
+
 @app.get("/api/client/release/manifest")
 async def release_manifest(authorization: Optional[str] = Header(default=None)):
     await active_loader_session(authorization)
@@ -1574,10 +1606,57 @@ async def release_manifest(authorization: Optional[str] = Header(default=None)):
 @app.get("/api/client/release/download")
 async def release_download(authorization: Optional[str] = Header(default=None)):
     await active_loader_session(authorization)
-    if not CLIENT_ARTIFACT_PATH or not Path(CLIENT_ARTIFACT_PATH).is_file():
-        raise HTTPException(status_code=503, detail="Release artifact unavailable")
-    return FileResponse(CLIENT_ARTIFACT_PATH, filename=Path(CLIENT_ARTIFACT_PATH).name,
-                        media_type="application/java-archive", headers={"Cache-Control": "no-store"})
+    if CLIENT_ARTIFACT_PATH and Path(CLIENT_ARTIFACT_PATH).is_file():
+        return FileResponse(CLIENT_ARTIFACT_PATH, filename=Path(CLIENT_ARTIFACT_PATH).name,
+                            media_type="application/java-archive", headers={"Cache-Control": "no-store"})
+    parts = sorted(Path(CLIENT_ENCRYPTED_PARTS_DIR).glob("artifact.part[0-9][0-9][0-9]"))
+    if not parts or not CLIENT_ARTIFACT_KEY_B64:
+        raise HTTPException(status_code=503, detail="Encrypted release unavailable")
+    try:
+        key = base64.b64decode(CLIENT_ARTIFACT_KEY_B64, validate=True)
+        if len(key) != 32 or [p.name for p in parts] != [f"artifact.part{i:03d}" for i in range(1, len(parts) + 1)]:
+            raise ValueError("Invalid encrypted release")
+        # Authenticate the entire ciphertext before streaming any plaintext.
+        await asyncio.to_thread(verify_encrypted_parts, parts, key)
+    except (ValueError, binascii.Error, OSError, InvalidTag):
+        raise HTTPException(status_code=503, detail="Encrypted release verification failed")
+    return StreamingResponse(iter_decrypted_parts(parts, key), media_type="application/java-archive",
+                             headers={"Cache-Control": "no-store", "Content-Disposition": "attachment; filename=fluxvisuals-licensed-1.0.0.jar"})
+
+
+def verify_encrypted_parts(parts: list[Path], key: bytes) -> None:
+    for _ in iter_decrypted_parts(parts, key):
+        pass
+
+
+def iter_decrypted_parts(parts: list[Path], key: bytes):
+    sizes = [p.stat().st_size for p in parts]
+    if sum(sizes) <= 28 or sizes[0] < 12 or sizes[-1] < 16:
+        raise ValueError("Encrypted release is incomplete")
+    with parts[0].open("rb") as first:
+        nonce = first.read(12)
+    with parts[-1].open("rb") as last:
+        last.seek(-16, 2)
+        tag = last.read(16)
+    decryptor = Cipher(algorithms.AES(key), modes.GCM(nonce, tag)).decryptor()
+    remaining = sum(sizes) - 28
+    for index, part in enumerate(parts):
+        with part.open("rb") as source:
+            if index == 0:
+                source.seek(12)
+            while remaining:
+                block = source.read(min(1024 * 1024, remaining))
+                if not block:
+                    break
+                remaining -= len(block)
+                plain = decryptor.update(block)
+                if plain:
+                    yield plain
+    if remaining:
+        raise ValueError("Encrypted release is truncated")
+    final = decryptor.finalize()
+    if final:
+        yield final
 
 
 def make_key_code(prefix="FLUX"):
@@ -1613,11 +1692,26 @@ async def admin_get_keys(authorization: Optional[str] = Header(default=None)):
         return [dict(r) for r in rows]
 
 
+@app.post("/api/admin/delete-keys")
+async def admin_delete_keys(data: DeleteKeysRequest, authorization: Optional[str] = Header(default=None)):
+    require_admin(authorization)
+    keys = list(dict.fromkeys(k.strip().upper() for k in data.keys if k.strip()))
+    if not keys or len(keys) > 100 or any(len(k) > 100 for k in keys):
+        raise HTTPException(status_code=400, detail="Invalid key list")
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "DELETE FROM license_keys WHERE key_code=ANY($1::text[]) AND is_used=FALSE RETURNING key_code",
+            keys,
+        )
+    await log_action("admin_api", "delete_keys", f"{len(rows)} unused keys")
+    return {"success": True, "deleted": len(rows)}
+
+
 @app.get("/api/admin/users")
 async def admin_get_users(authorization: Optional[str] = Header(default=None)):
     require_admin(authorization)
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT id, username, hwid, status, expires_at, created_at, last_login, login_count, ban_reason, note FROM users ORDER BY id DESC LIMIT 500")
+        rows = await conn.fetch("SELECT id, username, role, hwid, status, expires_at, created_at, last_login, login_count, ban_reason, note FROM users ORDER BY id DESC LIMIT 500")
         return [dict(r) for r in rows]
 
 
