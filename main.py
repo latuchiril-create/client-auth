@@ -36,7 +36,6 @@ except ImportError:
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DB_URL = os.getenv("DB_URL")
-API_KEY = os.getenv("API_KEY")                      # опционально: заголовок X-Api-Key
 TZ = timezone(timedelta(hours=int(os.getenv("TZ_OFFSET", "3"))))
 PAGE_SIZE = 6
 LOG_PAGE_SIZE = 8
@@ -1196,21 +1195,192 @@ dp.include_router(admin)      # сначала админ
 dp.include_router(fallback)   # потом заглушка
 
 
-# ============================ FASTAPI ============================
+# ============================ SECURE CLIENT API ============================
+# The Telegram administration above is retained from the supplied server.
+# Client and admin HTTP authentication below is intentionally independent.
+import hmac
+import json
+import re
+import time
+import base64
+import binascii
+from pathlib import Path
+
+from argon2 import PasswordHasher
+from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
+from fastapi import Request
+from fastapi.responses import FileResponse, JSONResponse
+
+
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
+CLIENT_MANIFEST_PATH = os.getenv("CLIENT_MANIFEST_PATH", "")
+CLIENT_ARTIFACT_PATH = os.getenv("CLIENT_ARTIFACT_PATH", "")
+PASSWORD_HASHER = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=4)
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,32}$")
+_attempts: dict[str, list[float]] = {}
+
+
+def rate_limit(request: Request, action: str, limit: int = 12, window: int = 900) -> None:
+    """A local abuse guard; deploy a shared gateway limit for multiple workers."""
+    peer = request.client.host if request.client else "unknown"
+    key = f"{action}:{peer}"
+    now = time.monotonic()
+    hits = [t for t in _attempts.get(key, []) if now - t < window]
+    if len(hits) >= limit:
+        raise HTTPException(status_code=429, detail="Too many attempts")
+    hits.append(now)
+    _attempts[key] = hits
+
+
+def require_admin(authorization: Optional[str]) -> None:
+    supplied = (authorization or "").removeprefix("Bearer ").strip()
+    if not ADMIN_API_KEY or not supplied or not hmac.compare_digest(supplied, ADMIN_API_KEY):
+        raise HTTPException(status_code=403, detail="Admin authorization required")
+
+
+def hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def bearer_token(authorization: Optional[str]) -> str:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Bearer session required")
+    token = authorization[7:].strip()
+    if len(token) < 40 or len(token) > 200:
+        raise HTTPException(status_code=401, detail="Invalid session")
+    return token
+
+
+def password_ok(encoded: Optional[str], password: str) -> tuple[bool, bool]:
+    """Return (valid, needs_migration). Empty legacy passwords are never claimed."""
+    if not encoded:
+        return False, False
+    if encoded.startswith("$argon2id$"):
+        try:
+            return PASSWORD_HASHER.verify(encoded, password), PASSWORD_HASHER.check_needs_rehash(encoded)
+        except (VerifyMismatchError, VerificationError, InvalidHashError):
+            return False, False
+    if re.fullmatch(r"[a-fA-F0-9]{64}", encoded):
+        legacy = hashlib.sha256(password.encode("utf-8")).hexdigest()
+        valid = hmac.compare_digest(encoded.lower(), legacy)
+        return valid, valid
+    return False, False
+
+
+async def init_security_db() -> None:
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'user';
+            CREATE TABLE IF NOT EXISTS client_sessions (
+                token_hash TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                scope TEXT NOT NULL CHECK (scope IN ('web', 'loader')),
+                hwid TEXT,
+                expires_at TIMESTAMPTZ NOT NULL,
+                revoked_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            CREATE INDEX IF NOT EXISTS client_sessions_user_idx ON client_sessions(user_id);
+            CREATE INDEX IF NOT EXISTS client_sessions_exp_idx ON client_sessions(expires_at);
+        """)
+        await conn.execute("""
+            UPDATE users SET role=LOWER(SUBSTRING(note FROM 6))
+            WHERE role='user' AND note ~* '^ROLE:(user|mod|admin|owner)$'
+        """)
+
+
+async def create_session(conn, user_id: int, scope: str, hwid: Optional[str] = None) -> str:
+    token = secrets.token_urlsafe(48)
+    lifetime = timedelta(days=1 if scope == "web" else 7)
+    await conn.execute(
+        "INSERT INTO client_sessions(token_hash,user_id,scope,hwid,expires_at) VALUES($1,$2,$3,$4,$5)",
+        hash_token(token), user_id, scope, hwid, now_utc() + lifetime,
+    )
+    return token
+
+
+async def authenticated_user(authorization: Optional[str], scopes: tuple[str, ...] = ("web", "loader")):
+    token = bearer_token(authorization)
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT s.scope, s.hwid AS session_hwid, u.*
+            FROM client_sessions s JOIN users u ON u.id=s.user_id
+            WHERE s.token_hash=$1 AND s.revoked_at IS NULL AND s.expires_at>now()
+        """, hash_token(token))
+    if not row or row["scope"] not in scopes:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    return row
+
+
+def public_user(user) -> dict:
+    status = user["status"]
+    expires = aware(user["expires_at"])
+    if status == "active" and expires and expires <= now_utc():
+        status = "expired"
+    return {
+        "id": user["id"], "username": user["username"], "status": status,
+        "role": user["role"],
+        "plan": "licensed" if status == "active" else "free",
+        "expires_at": expires.isoformat() if expires else None,
+        "days_left": max(0, (expires - now_utc()).days) if expires else None,
+    }
+
+
+async def license_result(conn, user, hwid: str, *, may_bind: bool) -> dict:
+    if flag("maintenance"):
+        return {"status": "maintenance"}
+    if user["status"] != "active":
+        return {"status": user["status"]}
+    expires = aware(user["expires_at"])
+    if expires and expires <= now_utc():
+        return {"status": "expired", "expires_at": expires.isoformat()}
+    if await hwid_banned(conn, hwid):
+        return {"status": "banned"}
+    stored = user["hwid"]
+    if not stored and may_bind:
+        await conn.execute("UPDATE users SET hwid=$1 WHERE id=$2 AND hwid IS NULL", hwid, user["id"])
+        stored = await conn.fetchval("SELECT hwid FROM users WHERE id=$1", user["id"])
+    if flag("hwid_lock") and stored != hwid:
+        return {"status": "hwid_mismatch"}
+    return {"status": "ok", "username": user["username"],
+            "expires_at": expires.isoformat() if expires else None}
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global db_pool
-    db_pool = await asyncpg.create_pool(DB_URL, statement_cache_size=0)  # совместимо с pooler Supabase
+    if not DB_URL:
+        raise RuntimeError("DB_URL is required")
+    db_pool = await asyncpg.create_pool(DB_URL, statement_cache_size=0)
     await init_db()
+    await init_security_db()
     await bot.delete_webhook(drop_pending_updates=True)
     task = asyncio.create_task(dp.start_polling(bot, handle_signals=False))
-    yield
-    task.cancel()
-    await bot.session.close()
-    await db_pool.close()
+    try:
+        yield
+    finally:
+        task.cancel()
+        await bot.session.close()
+        await db_pool.close()
 
 
-app = FastAPI(title="License Control API", lifespan=lifespan)
+app = FastAPI(title="Fuga License API", lifespan=lifespan)
+
+
+class RegisterRequest(BaseModel):
+    username: str
+    password: str
+    email: Optional[str] = ""
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
 
 
 class AuthRequest(BaseModel):
@@ -1219,298 +1389,9 @@ class AuthRequest(BaseModel):
     password: Optional[str] = None
 
 
-class RegisterRequest(BaseModel):
-    username: str
-    password: str
-    email: Optional[str] = ""
-    hwid: str
-
-
-async def notify_new_request(u):
-    try:
-        email_str = f"\n📧 Почта: <code>{esc(u.get('email') or '—')}</code>" if u.get('email') else ""
-        caption = (
-            "🔔 <b>Новая заявка на доступ!</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            f"👤 Ник: <code>{esc(u['username'])}</code>{email_str}\n"
-            f"🔑 HWID: <code>{esc(u['hwid'])}</code>\n"
-            f"🕒 {fmt_dt(u['created_at'])}"
-        )
-        photo, key = await get_banner("New request", u["username"], "pending", "🔔")
-        msg = await bot.send_photo(ADMIN_ID, photo=photo, caption=caption, reply_markup=kb_user_card(u))
-        if msg.photo:
-            BANNER_CACHE[key] = msg.photo[-1].file_id
-    except Exception as e:
-        print(f"[TG] notify_new_request error: {e}")
-
-
-async def notify_hwid_mismatch(u, new_hwid: str):
-    last = HWID_ALERT_AT.get(u["username"])
-    if last and (now_utc() - last) < timedelta(minutes=10):
-        return
-    HWID_ALERT_AT[u["username"]] = now_utc()
-    try:
-        caption = (
-            "⚠️ <b>Попытка входа с другого HWID</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            f"👤 Ник: <code>{esc(u['username'])}</code>\n"
-            f"🔑 Привязан: <code>{esc(u['hwid'])}</code>\n"
-            f"🆕 Новый: <code>{esc(new_hwid)}</code>\n"
-            f"🕒 {fmt_dt(now_utc())}"
-        )
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [B("🔑 Сбросить HWID", f"act:resethwid:{u['username']}"), B("⛔ Забанить", f"act:banq:{u['username']}")],
-            [B("👤 Открыть карточку", f"view:{u['username']}")],
-        ])
-        photo, key = await get_banner("HWID alert", u["username"], "warn", "⚠️")
-        msg = await bot.send_photo(ADMIN_ID, photo=photo, caption=caption, reply_markup=kb)
-        if msg.photo:
-            BANNER_CACHE[key] = msg.photo[-1].file_id
-    except Exception as e:
-        print(f"[TG] notify_hwid error: {e}")
-
-
-@app.get("/health")
-async def health():
-    return {"ok": True, "time": now_utc().isoformat()}
-
-
-@app.get("/api/client/me")
-async def client_me(authorization: Optional[str] = Header(default=None)):
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    token_user = authorization.replace("Bearer ", "").replace("token_", "").strip()
-    async with db_pool.acquire() as conn:
-        user = await conn.fetchrow("SELECT id, username, status, expires_at, hwid, created_at FROM users WHERE LOWER(username) = LOWER($1)", token_user)
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
-        return {
-            "id": user["id"],
-            "username": user["username"],
-            "status": user["status"],
-            "plan": "free" if user["status"] == "pending" else "licensed",
-            "expires_at": user["expires_at"].isoformat() if user["expires_at"] else None,
-            "hwid": user["hwid"]
-        }
-
-
-@app.post("/api/client/register")
-async def client_register(data: ClientRegisterRequest):
-    username = data.username.strip()[:32]
-    password = data.password.strip()
-    email = (data.email or "").strip()[:64]
-
-    if not username or len(username) < 3:
-        return {"success": False, "message": "Логин должен быть от 3 символов"}
-    if not password or len(password) < 4:
-        return {"success": False, "message": "Пароль должен быть не менее 4 символов"}
-
-    pw_hash = hashlib.sha256(password.encode()).hexdigest()
-
-    async with db_pool.acquire() as conn:
-        exists = await conn.fetchval("SELECT 1 FROM users WHERE LOWER(username) = LOWER($1)", username)
-        if exists:
-            return {"success": False, "message": "Пользователь с таким ником уже зарегистрирован"}
-
-        auto = flag("auto_approve")
-        u = await conn.fetchrow(
-            "INSERT INTO users (username, password_hash, email, status, expires_at) "
-            "VALUES ($1, $2, $3, $4, $5) RETURNING *",
-            username, pw_hash, email, "active" if auto else "pending", default_expiry() if auto else None
-        )
-        await log_action("web", "register", username, email or "no email")
-        if not auto:
-            asyncio.create_task(notify_new_request(u))
-
-    return {
-        "success": True,
-        "token": f"token_{username}",
-        "user": {
-            "id": u["id"],
-            "username": u["username"],
-            "status": u["status"],
-            "plan": "free" if u["status"] == "pending" else "licensed",
-            "expires_at": u["expires_at"].isoformat() if u["expires_at"] else None
-        }
-    }
-
-
-@app.post("/api/client/login")
-async def client_login(data: ClientLoginRequest):
-    username = data.username.strip()[:32]
-    password = data.password.strip()
-
-    if not username or not password:
-        return {"success": False, "message": "Заполните все поля"}
-
-    pw_hash = hashlib.sha256(password.encode()).hexdigest()
-
-    async with db_pool.acquire() as conn:
-        user = await conn.fetchrow("SELECT * FROM users WHERE LOWER(username) = LOWER($1)", username)
-        if not user:
-            return {"success": False, "message": "Пользователь не найден"}
-
-        if user["password_hash"] and user["password_hash"] != pw_hash:
-            return {"success": False, "message": "Неверный пароль"}
-        elif not user["password_hash"]:
-            await conn.execute("UPDATE users SET password_hash = $1 WHERE id = $2", pw_hash, user["id"])
-
-        return {
-            "success": True,
-            "token": f"token_{user['username']}",
-            "user": {
-                "id": user["id"],
-                "username": user["username"],
-                "status": user["status"],
-                "plan": "free" if user["status"] == "pending" else "licensed",
-                "expires_at": user["expires_at"].isoformat() if user["expires_at"] else None,
-                "hwid": user["hwid"]
-            }
-        }
-
-
-@app.post("/api/register")
-async def register(data: RegisterRequest, x_api_key: Optional[str] = Header(default=None)):
-    if API_KEY and x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="bad api key")
-
-    username = data.username.strip()[:32]
-    password = data.password.strip()
-    email = (data.email or "").strip()[:64]
-    hwid = data.hwid.strip()[:256]
-
-    if not username or len(username) < 3:
-        raise HTTPException(status_code=400, detail="Логин должен быть от 3 символов")
-    if not password or len(password) < 4:
-        raise HTTPException(status_code=400, detail="Пароль должен быть не менее 4 символов")
-    if not hwid:
-        raise HTTPException(status_code=400, detail="hwid required")
-
-    pw_hash = hashlib.sha256(password.encode()).hexdigest()
-
-    async with db_pool.acquire() as conn:
-        # HWID blacklist check
-        hb = await hwid_banned(conn, hwid)
-        if hb:
-            return {"status": "banned", "message": hb["reason"] or "Ваше оборудование заблокировано."}
-
-        exists = await conn.fetchval("SELECT 1 FROM users WHERE LOWER(username) = LOWER($1)", username)
-        if exists:
-            return {"status": "already_exists", "message": "Пользователь с таким логином уже зарегистрирован."}
-
-        auto = flag("auto_approve")
-        u = await conn.fetchrow(
-            "INSERT INTO users (username, password_hash, email, hwid, status, expires_at) "
-            "VALUES ($1, $2, $3, $4, $5, $6) RETURNING *",
-            username, pw_hash, email, hwid, "active" if auto else "pending", default_expiry() if auto else None
-        )
-        await log_action("api", "register", username, email or "no email")
-        # Уведомление администратору отправляется ТОЛЬКО при реальной заявке из лаунчера/клиента, а не при простом посещении сайта
-        if not auto and not hwid.startswith("WEB_"):
-            asyncio.create_task(notify_new_request(u))
-
-    return {
-        "status": "ok",
-        "user_status": "active" if auto else "pending",
-        "expires_at": u["expires_at"].isoformat() if u and u["expires_at"] else None,
-        "days_left": int(get_setting("default_days") or 30) if auto else None,
-        "message": "Регистрация успешна!"
-    }
-
-
-@app.post("/api/auth")
-async def auth(data: AuthRequest, x_api_key: Optional[str] = Header(default=None)):
-    if API_KEY and x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="bad api key")
-
-    username, hwid = data.username.strip()[:32], data.hwid.strip()[:256]
-    if not username or not hwid:
-        raise HTTPException(status_code=400, detail="username/hwid required")
-
-    if flag("maintenance"):
-        return {"status": "maintenance", "message": "Ведутся технические работы. Попробуйте позже."}
-
-    async with db_pool.acquire() as conn:
-        user = await conn.fetchrow("SELECT * FROM users WHERE LOWER(username) = LOWER($1)", username)
-
-        # ---- HWID в чёрном списке → бан любому нику с этого железа ----
-        hb = await hwid_banned(conn, hwid)
-        if hb:
-            reason = hb["reason"] or "Вы заблокированы."
-            twin_reason = f"{reason} (твинк {hb['username']})" if hb["username"] and hb["username"] != username else reason
-            if not user:
-                await conn.execute(
-                    "INSERT INTO users (username, hwid, status, ban_reason) VALUES ($1,$2,'banned',$3)",
-                    username, hwid, twin_reason)
-                await log_action("api", "hwid_ban", username, f"alt of {hb['username']}")
-            elif user["status"] != "banned":
-                await conn.execute("UPDATE users SET status='banned', ban_reason=$2 WHERE username=$1",
-                                   username, twin_reason)
-                await log_action("api", "hwid_ban", username, f"alt of {hb['username']}")
-            return {"status": "banned", "message": reason}
-
-        # ---- пользователь не существует -> НЕ создаем автоматически! ----
-        if not user:
-            return {"status": "not_found", "message": "Пользователь не найден. Зарегистрируйтесь."}
-
-        # ---- проверка пароля (если передан лаунчером) ----
-        if data.password:
-            pw_hash = hashlib.sha256(data.password.strip().encode()).hexdigest()
-            if user["password_hash"] and user["password_hash"] != pw_hash:
-                return {"status": "invalid_password", "message": "Неверный пароль."}
-            elif not user["password_hash"]:
-                # При первом входе без пароля у старых юзеров привязываем введенный пароль
-                await conn.execute("UPDATE users SET password_hash = $1 WHERE id = $2", pw_hash, user["id"])
-
-        # ---- забанен по нику → на всякий случай заносим его железо в чёрный список ----
-        if user["status"] == "banned":
-            if flag("hwid_ban"):
-                await conn.execute(
-                    "INSERT INTO banned_hwids(hwid, username, reason) VALUES($1,$2,$3) ON CONFLICT (hwid) DO NOTHING",
-                    hwid, username, user["ban_reason"])
-            return {"status": "banned", "message": user["ban_reason"] or "Вы заблокированы."}
-
-        if user["status"] == "pending":
-            return {"status": "pending", "message": "Подписка ещё не одобрена администратором.", "note": user["note"] or None}
-
-        if user["expires_at"] and aware(user["expires_at"]) < now_utc():
-            return {"status": "expired", "message": "Срок подписки истёк.",
-                    "expires_at": user["expires_at"].isoformat(),
-                    "note": user["note"] or None}
-
-        # ---- HWID привязка / проверка (СТРОГО для реального клиента/лаунчера, сайт с WEB_ не проверяет HWID) ----
-        is_web_req = hwid.startswith("WEB_") or hwid == "WEB"
-        if not is_web_req:
-            if not user["hwid"] or user["hwid"].startswith("WEB_"):
-                await conn.execute("UPDATE users SET hwid = $1 WHERE id = $2", hwid, user["id"])
-            elif flag("hwid_lock") and user["hwid"] != hwid:
-                await log_action("api", "hwid_mismatch", username, hwid[:40])
-                if flag("notify_hwid"):
-                    asyncio.create_task(notify_hwid_mismatch(user, hwid))
-                return {"status": "hwid_mismatch", "message": "HWID не совпадает с привязанным!"}
-
-        await conn.execute("UPDATE users SET last_login=now(), login_count=login_count+1 WHERE id=$1", user["id"])
-
-    days_left = None
-    if user["expires_at"]:
-        days_left = max(0, (aware(user["expires_at"]) - now_utc()).days)
-    return {"status": "ok", "message": "Доступ разрешён.",
-            "expires_at": user["expires_at"].isoformat() if user["expires_at"] else None,
-            "days_left": days_left,
-            "note": user["note"] or None}
-
-
-# ============================ KEYS & ADMIN API ============================
-def make_key_code(prefix="FLUX"):
-    p1 = secrets.token_hex(2).upper()
-    p2 = secrets.token_hex(2).upper()
-    p3 = secrets.token_hex(2).upper()
-    return f"{prefix}-{p1}-{p2}-{p3}"
-
-
 class RedeemRequest(BaseModel):
-    username: str
     key: str
+    username: Optional[str] = None
 
 
 class CreateKeyRequest(BaseModel):
@@ -1527,45 +1408,187 @@ class AdminUserActionRequest(BaseModel):
     role: Optional[str] = None
 
 
-@app.post("/api/client/redeem")
-async def client_redeem(data: RedeemRequest):
+class AdminPasswordRequest(BaseModel):
+    username: str
+    password: str
+
+
+@app.get("/health")
+async def health():
+    return {"ok": True, "time": now_utc().isoformat()}
+
+
+@app.post("/api/client/register")
+@app.post("/api/register")
+async def client_register(data: RegisterRequest, request: Request):
+    rate_limit(request, "register", 5)
     username = data.username.strip()
-    key_code = data.key.strip().upper()
-
-    if not username or not key_code:
-        return {"success": False, "message": "Введите логин и ключ активации"}
-
+    if not USERNAME_RE.fullmatch(username) or len(data.password) < 12 or len(data.password) > 256:
+        raise HTTPException(status_code=400, detail="Invalid username or password")
+    email = (data.email or "").strip()[:254]
+    encoded = PASSWORD_HASHER.hash(data.password)
     async with db_pool.acquire() as conn:
-        user = await conn.fetchrow("SELECT * FROM users WHERE LOWER(username) = LOWER($1)", username)
-        if not user:
-            return {"success": False, "message": "Пользователь не найден"}
+        async with conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext(lower($1)))", username)
+            if await conn.fetchval("SELECT 1 FROM users WHERE LOWER(username)=LOWER($1)", username):
+                raise HTTPException(status_code=409, detail="Username already exists")
+            user = await conn.fetchrow("""
+                INSERT INTO users(username,password_hash,email,status,expires_at)
+                VALUES($1,$2,$3,$4,$5) RETURNING *
+            """, username, encoded, email, "active" if flag("auto_approve") else "pending",
+                default_expiry() if flag("auto_approve") else None)
+            token = await create_session(conn, user["id"], "web")
+    await log_action("api", "register", username)
+    if user["status"] == "pending":
+        asyncio.create_task(notify_new_request(user))
+    return {"success": True, "token": token, "user": public_user(user)}
 
-        k = await conn.fetchrow("SELECT * FROM license_keys WHERE UPPER(key_code) = $1 AND is_used = FALSE", key_code)
-        if not k:
-            return {"success": False, "message": "Ключ недействителен или уже активирован"}
 
-        days = k["days"]
-        current_exp = aware(user["expires_at"]) if user["expires_at"] else None
-        base_time = current_exp if current_exp and current_exp > now_utc() else now_utc()
-        new_exp = base_time + timedelta(days=days) if days > 0 else None
+@app.post("/api/client/login")
+async def client_login(data: LoginRequest, request: Request):
+    rate_limit(request, "login", 10)
+    async with db_pool.acquire() as conn:
+        user = await conn.fetchrow("SELECT * FROM users WHERE LOWER(username)=LOWER($1)", data.username.strip())
+        valid, migrate = password_ok(user["password_hash"] if user else None, data.password)
+        if not user or not valid or user["status"] == "banned":
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        if migrate:
+            await conn.execute("UPDATE users SET password_hash=$1 WHERE id=$2", PASSWORD_HASHER.hash(data.password), user["id"])
+        token = await create_session(conn, user["id"], "web")
+        await conn.execute("UPDATE users SET last_login=now(),login_count=login_count+1 WHERE id=$1", user["id"])
+    return {"success": True, "token": token, "user": public_user(user)}
 
-        await conn.execute("UPDATE users SET status = 'active', expires_at = $1 WHERE id = $2", new_exp, user["id"])
-        await conn.execute("UPDATE license_keys SET is_used = TRUE, used_by = $1 WHERE id = $2", user["username"], k["id"])
-        await log_action("web", "redeem_key", user["username"], f"{key_code} (+{days}d)")
 
-    return {
-        "success": True,
-        "message": f"Ключ успешно активирован! Добавлено +{days} дней.",
-        "expires_at": new_exp.isoformat() if new_exp else None,
-        "days_left": (new_exp - now_utc()).days if new_exp else None
-    }
+@app.get("/api/client/me")
+async def client_me(authorization: Optional[str] = Header(default=None)):
+    user = await authenticated_user(authorization)
+    return public_user(user)
+
+
+@app.post("/api/client/logout")
+async def client_logout(authorization: Optional[str] = Header(default=None)):
+    token = bearer_token(authorization)
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE client_sessions SET revoked_at=now() WHERE token_hash=$1", hash_token(token))
+    return {"success": True}
+
+
+@app.post("/api/client/change-password")
+async def client_change_password(data: ChangePasswordRequest, request: Request,
+                                 authorization: Optional[str] = Header(default=None)):
+    rate_limit(request, "change_password", 6)
+    user = await authenticated_user(authorization)
+    if len(data.new_password) < 12 or len(data.new_password) > 256:
+        raise HTTPException(status_code=400, detail="Password must be 12-256 characters")
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            current_hash = await conn.fetchval("SELECT password_hash FROM users WHERE id=$1 FOR UPDATE", user["id"])
+            valid, _ = password_ok(current_hash, data.current_password)
+            if not valid:
+                raise HTTPException(status_code=401, detail="Invalid current password")
+            await conn.execute("UPDATE users SET password_hash=$1 WHERE id=$2",
+                               PASSWORD_HASHER.hash(data.new_password), user["id"])
+            await conn.execute("UPDATE client_sessions SET revoked_at=now() WHERE user_id=$1 AND revoked_at IS NULL", user["id"])
+    await log_action("api", "change_password", user["username"])
+    return {"success": True, "reauth_required": True}
+
+
+@app.post("/api/auth")
+async def auth(data: AuthRequest, request: Request, authorization: Optional[str] = Header(default=None)):
+    username, hwid = data.username.strip(), data.hwid.strip()
+    if not USERNAME_RE.fullmatch(username) or not 16 <= len(hwid) <= 256:
+        raise HTTPException(status_code=400, detail="Invalid username or hardware identifier")
+    if data.password is not None:
+        rate_limit(request, "loader_login", 10)
+        async with db_pool.acquire() as conn:
+            user = await conn.fetchrow("SELECT * FROM users WHERE LOWER(username)=LOWER($1)", username)
+            valid, migrate = password_ok(user["password_hash"] if user else None, data.password)
+            if not user or not valid:
+                raise HTTPException(status_code=401, detail="Invalid credentials")
+            if migrate:
+                await conn.execute("UPDATE users SET password_hash=$1 WHERE id=$2", PASSWORD_HASHER.hash(data.password), user["id"])
+            result = await license_result(conn, user, hwid, may_bind=True)
+            if result["status"] == "ok":
+                result["token"] = await create_session(conn, user["id"], "loader", hwid)
+                await conn.execute("UPDATE users SET last_login=now(),login_count=login_count+1 WHERE id=$1", user["id"])
+            return result
+    session = await authenticated_user(authorization, ("loader",))
+    if session["username"].lower() != username.lower() or session["session_hwid"] != hwid:
+        raise HTTPException(status_code=401, detail="Session identity mismatch")
+    async with db_pool.acquire() as conn:
+        return await license_result(conn, session, hwid, may_bind=False)
+
+
+@app.post("/api/client/redeem")
+async def client_redeem(data: RedeemRequest, authorization: Optional[str] = Header(default=None)):
+    user = await authenticated_user(authorization)
+    if data.username and data.username.lower() != user["username"].lower():
+        raise HTTPException(status_code=403, detail="Cannot redeem for another user")
+    key_code = data.key.strip().upper()
+    if not key_code or len(key_code) > 100:
+        raise HTTPException(status_code=400, detail="Invalid key")
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            locked_user = await conn.fetchrow("SELECT * FROM users WHERE id=$1 FOR UPDATE", user["id"])
+            key = await conn.fetchrow("SELECT * FROM license_keys WHERE key_code=$1 FOR UPDATE", key_code)
+            if not key or key["is_used"]:
+                raise HTTPException(status_code=400, detail="Invalid or used key")
+            base = max(now_utc(), aware(locked_user["expires_at"])) if locked_user["expires_at"] else now_utc()
+            expires = base + timedelta(days=key["days"]) if key["days"] > 0 else None
+            await conn.execute("UPDATE users SET status='active',expires_at=$1 WHERE id=$2", expires, user["id"])
+            await conn.execute("UPDATE license_keys SET is_used=TRUE,used_by=$1 WHERE id=$2", user["username"], key["id"])
+    await log_action("api", "redeem_key", user["username"], f"{key['days']} days")
+    return {"success": True, "expires_at": expires.isoformat() if expires else None}
+
+
+async def active_loader_session(authorization: Optional[str]):
+    user = await authenticated_user(authorization, ("loader",))
+    async with db_pool.acquire() as conn:
+        status = await license_result(conn, user, user["session_hwid"], may_bind=False)
+    if status["status"] != "ok":
+        raise HTTPException(status_code=403, detail=status["status"])
+    return user
+
+
+@app.get("/api/client/release/manifest")
+async def release_manifest(authorization: Optional[str] = Header(default=None)):
+    await active_loader_session(authorization)
+    if not CLIENT_MANIFEST_PATH:
+        raise HTTPException(status_code=503, detail="Release is not configured")
+    path = Path(CLIENT_MANIFEST_PATH)
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise HTTPException(status_code=503, detail="Release manifest unavailable")
+    try:
+        payload = base64.b64decode(manifest["payload"], validate=True)
+        base64.b64decode(manifest["signature"], validate=True)
+        release = json.loads(payload)
+        if not all(k in release for k in ("version", "sha256", "size", "minecraft_version")):
+            raise ValueError("Incomplete release payload")
+    except (KeyError, TypeError, ValueError, binascii.Error):
+        raise HTTPException(status_code=503, detail="Release manifest incomplete")
+    return JSONResponse(manifest, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/client/release/download")
+async def release_download(authorization: Optional[str] = Header(default=None)):
+    await active_loader_session(authorization)
+    if not CLIENT_ARTIFACT_PATH or not Path(CLIENT_ARTIFACT_PATH).is_file():
+        raise HTTPException(status_code=503, detail="Release artifact unavailable")
+    return FileResponse(CLIENT_ARTIFACT_PATH, filename=Path(CLIENT_ARTIFACT_PATH).name,
+                        media_type="application/java-archive", headers={"Cache-Control": "no-store"})
+
+
+def make_key_code(prefix="FLUX"):
+    return f"{prefix}-{secrets.token_hex(6).upper()}"
+
+
 
 
 @app.post("/api/admin/create-keys")
 async def admin_create_keys(data: CreateKeyRequest, authorization: Optional[str] = Header(default=None)):
-    secret = (authorization or "").replace("Bearer ", "").strip()
-    if secret != "fuga_admin_secret_key_2026" and (not API_KEY or secret != API_KEY):
-        raise HTTPException(status_code=403, detail="Invalid admin secret")
+    require_admin(authorization)
 
     count = max(1, min(100, data.count))
     generated = []
@@ -1584,9 +1607,7 @@ async def admin_create_keys(data: CreateKeyRequest, authorization: Optional[str]
 
 @app.get("/api/admin/keys")
 async def admin_get_keys(authorization: Optional[str] = Header(default=None)):
-    secret = (authorization or "").replace("Bearer ", "").strip()
-    if secret != "fuga_admin_secret_key_2026" and (not API_KEY or secret != API_KEY):
-        raise HTTPException(status_code=403, detail="Invalid admin secret")
+    require_admin(authorization)
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT * FROM license_keys ORDER BY id DESC LIMIT 200")
         return [dict(r) for r in rows]
@@ -1594,9 +1615,7 @@ async def admin_get_keys(authorization: Optional[str] = Header(default=None)):
 
 @app.get("/api/admin/users")
 async def admin_get_users(authorization: Optional[str] = Header(default=None)):
-    secret = (authorization or "").replace("Bearer ", "").strip()
-    if secret != "fuga_admin_secret_key_2026" and (not API_KEY or secret != API_KEY):
-        raise HTTPException(status_code=403, detail="Invalid admin secret")
+    require_admin(authorization)
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT id, username, hwid, status, expires_at, created_at, last_login, login_count, ban_reason, note FROM users ORDER BY id DESC LIMIT 500")
         return [dict(r) for r in rows]
@@ -1604,9 +1623,7 @@ async def admin_get_users(authorization: Optional[str] = Header(default=None)):
 
 @app.post("/api/admin/approve-user")
 async def admin_approve_user(data: AdminUserActionRequest, authorization: Optional[str] = Header(default=None)):
-    secret = (authorization or "").replace("Bearer ", "").strip()
-    if secret != "fuga_admin_secret_key_2026" and (not API_KEY or secret != API_KEY):
-        raise HTTPException(status_code=403, detail="Invalid admin secret")
+    require_admin(authorization)
     days = data.days if data.days is not None else int(get_setting("default_days") or 30)
     exp = now_utc() + timedelta(days=days) if days > 0 else None
     async with db_pool.acquire() as conn:
@@ -1617,9 +1634,7 @@ async def admin_approve_user(data: AdminUserActionRequest, authorization: Option
 
 @app.post("/api/admin/reject-user")
 async def admin_reject_user_api(data: AdminUserActionRequest, authorization: Optional[str] = Header(default=None)):
-    secret = (authorization or "").replace("Bearer ", "").strip()
-    if secret != "fuga_admin_secret_key_2026" and (not API_KEY or secret != API_KEY):
-        raise HTTPException(status_code=403, detail="Invalid admin secret")
+    require_admin(authorization)
     async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM users WHERE LOWER(username)=LOWER($1)", data.username)
         await log_action("admin_api", "delete", data.username, "rejected application")
@@ -1628,9 +1643,7 @@ async def admin_reject_user_api(data: AdminUserActionRequest, authorization: Opt
 
 @app.post("/api/admin/delete-user")
 async def admin_delete_user_api(data: AdminUserActionRequest, authorization: Optional[str] = Header(default=None)):
-    secret = (authorization or "").replace("Bearer ", "").strip()
-    if secret != "fuga_admin_secret_key_2026" and (not API_KEY or secret != API_KEY):
-        raise HTTPException(status_code=403, detail="Invalid admin secret")
+    require_admin(authorization)
     async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM users WHERE LOWER(username)=LOWER($1)", data.username)
         await log_action("admin_api", "delete", data.username)
@@ -1639,9 +1652,7 @@ async def admin_delete_user_api(data: AdminUserActionRequest, authorization: Opt
 
 @app.post("/api/admin/ban-user")
 async def admin_ban_user_api(data: AdminUserActionRequest, authorization: Optional[str] = Header(default=None)):
-    secret = (authorization or "").replace("Bearer ", "").strip()
-    if secret != "fuga_admin_secret_key_2026" and (not API_KEY or secret != API_KEY):
-        raise HTTPException(status_code=403, detail="Invalid admin secret")
+    require_admin(authorization)
     reason = data.reason or "Заблокирован администратором"
     async with db_pool.acquire() as conn:
         cnt = await ban_user(conn, data.username, reason)
@@ -1651,9 +1662,7 @@ async def admin_ban_user_api(data: AdminUserActionRequest, authorization: Option
 
 @app.post("/api/admin/unban-user")
 async def admin_unban_user_api(data: AdminUserActionRequest, authorization: Optional[str] = Header(default=None)):
-    secret = (authorization or "").replace("Bearer ", "").strip()
-    if secret != "fuga_admin_secret_key_2026" and (not API_KEY or secret != API_KEY):
-        raise HTTPException(status_code=403, detail="Invalid admin secret")
+    require_admin(authorization)
     async with db_pool.acquire() as conn:
         await unban_user(conn, data.username)
         await log_action("admin_api", "unban", data.username)
@@ -1662,20 +1671,33 @@ async def admin_unban_user_api(data: AdminUserActionRequest, authorization: Opti
 
 @app.post("/api/admin/reset-hwid")
 async def admin_reset_hwid_api(data: AdminUserActionRequest, authorization: Optional[str] = Header(default=None)):
-    secret = (authorization or "").replace("Bearer ", "").strip()
-    if secret != "fuga_admin_secret_key_2026" and (not API_KEY or secret != API_KEY):
-        raise HTTPException(status_code=403, detail="Invalid admin secret")
+    require_admin(authorization)
     async with db_pool.acquire() as conn:
         await conn.execute("UPDATE users SET hwid=NULL WHERE LOWER(username)=LOWER($1)", data.username)
         await log_action("admin_api", "reset_hwid", data.username)
     return {"success": True, "message": f"HWID для {data.username} успешно сброшен"}
 
 
+@app.post("/api/admin/set-password")
+async def admin_set_password_api(data: AdminPasswordRequest, authorization: Optional[str] = Header(default=None)):
+    require_admin(authorization)
+    if len(data.password) < 12 or len(data.password) > 256:
+        raise HTTPException(status_code=400, detail="Password must be 12-256 characters")
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            user_id = await conn.fetchval("SELECT id FROM users WHERE LOWER(username)=LOWER($1)", data.username)
+            if not user_id:
+                raise HTTPException(status_code=404, detail="User not found")
+            await conn.execute("UPDATE users SET password_hash=$1 WHERE id=$2",
+                               PASSWORD_HASHER.hash(data.password), user_id)
+            await conn.execute("UPDATE client_sessions SET revoked_at=now() WHERE user_id=$1 AND revoked_at IS NULL", user_id)
+    await log_action("admin_api", "set_password", data.username)
+    return {"success": True}
+
+
 @app.post("/api/admin/revoke-sub")
 async def admin_revoke_sub_api(data: AdminUserActionRequest, authorization: Optional[str] = Header(default=None)):
-    secret = (authorization or "").replace("Bearer ", "").strip()
-    if secret != "fuga_admin_secret_key_2026" and (not API_KEY or secret != API_KEY):
-        raise HTTPException(status_code=403, detail="Invalid admin secret")
+    require_admin(authorization)
     async with db_pool.acquire() as conn:
         await conn.execute("UPDATE users SET status='pending', expires_at=NULL WHERE LOWER(username)=LOWER($1)", data.username)
         await log_action("admin_api", "revoke_sub", data.username)
@@ -1684,29 +1706,27 @@ async def admin_revoke_sub_api(data: AdminUserActionRequest, authorization: Opti
 
 @app.post("/api/admin/set-role")
 async def admin_set_role_api(data: AdminUserActionRequest, authorization: Optional[str] = Header(default=None)):
-    secret = (authorization or "").replace("Bearer ", "").strip()
-    if secret != "fuga_admin_secret_key_2026" and (not API_KEY or secret != API_KEY):
-        raise HTTPException(status_code=403, detail="Invalid admin secret")
-    role = (data.role or "User").strip()
+    require_admin(authorization)
+    role = (data.role or "user").strip().lower()
+    if role not in {"user", "mod", "admin", "owner"}:
+        raise HTTPException(status_code=400, detail="Invalid role")
     async with db_pool.acquire() as conn:
-        await conn.execute("UPDATE users SET note=$1 WHERE LOWER(username)=LOWER($2)", f"ROLE:{role}", data.username)
+        await conn.execute("""UPDATE users SET role=$1,
+            note=CASE WHEN note ~* '^ROLE:(user|mod|admin|owner)$' THEN NULL ELSE note END
+            WHERE LOWER(username)=LOWER($2)""", role, data.username)
         await log_action("admin_api", "set_role", data.username, role)
     return {"success": True, "message": f"Пользователю {data.username} присвоен префикс [{role}]"}
 
 
 @app.get("/api/admin/settings")
 async def admin_get_settings_api(authorization: Optional[str] = Header(default=None)):
-    secret = (authorization or "").replace("Bearer ", "").strip()
-    if secret != "fuga_admin_secret_key_2026" and (not API_KEY or secret != API_KEY):
-        raise HTTPException(status_code=403, detail="Invalid admin secret")
+    require_admin(authorization)
     return {"success": True, "settings": {k: get_setting(k) for k in DEFAULT_SETTINGS}}
 
 
 @app.post("/api/admin/settings")
 async def admin_update_settings_api(data: dict, authorization: Optional[str] = Header(default=None)):
-    secret = (authorization or "").replace("Bearer ", "").strip()
-    if secret != "fuga_admin_secret_key_2026" and (not API_KEY or secret != API_KEY):
-        raise HTTPException(status_code=403, detail="Invalid admin secret")
+    require_admin(authorization)
     for k, v in data.items():
         if k in DEFAULT_SETTINGS:
             await set_setting(k, str(v))
@@ -1716,9 +1736,7 @@ async def admin_update_settings_api(data: dict, authorization: Optional[str] = H
 
 @app.get("/api/admin/stats")
 async def admin_stats_api(authorization: Optional[str] = Header(default=None)):
-    secret = (authorization or "").replace("Bearer ", "").strip()
-    if secret != "fuga_admin_secret_key_2026" and (not API_KEY or secret != API_KEY):
-        raise HTTPException(status_code=403, detail="Invalid admin secret")
+    require_admin(authorization)
     async with db_pool.acquire() as conn:
         c = await get_counts(conn)
         return {"success": True, "stats": c}
