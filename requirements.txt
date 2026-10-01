@@ -4,3 +4,5 @@ asyncpg
 aiogram>=3.4
 pillow>=10.1
 python-dotenv
+httpx>=0.27
+argon2-cffi>=23.1,<26
